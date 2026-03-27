@@ -52,3 +52,7 @@ client/web/build/assets
 
 # Ignore personal IntelliJ settings
 .idea/
+build/
+*.exe
+*.zip
+.DS_Store

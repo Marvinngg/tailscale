@@ -1,0 +1,77 @@
+// 模拟广告服务器。提供以下端点：
+//
+//	GET /ad/splash     → 返回开屏广告 JSON（应该被拦截）
+//	GET /api/feed      → 返回混合内容（广告+正常内容，应被 JS 脚本精确删除广告字段）
+//	GET /normal        → 正常内容（不应被拦截）
+//	GET /health        → 健康检查
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+)
+
+func main() {
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8888"
+	}
+
+	mux := http.NewServeMux()
+
+	// 开屏广告（应该被 reject-dict 拦截）
+	mux.HandleFunc("/ad/splash", func(w http.ResponseWriter, r *http.Request) {
+		log.Printf("→ %s %s (should be blocked)", r.Method, r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"splash_ad": map[string]interface{}{
+				"image_url":  "https://ad-cdn.example.com/splash_001.jpg",
+				"click_url":  "https://ad-track.example.com/click?id=001",
+				"duration_s": 5,
+			},
+		})
+	})
+
+	// 混合内容 API（广告和正常内容混在同一响应中）
+	mux.HandleFunc("/api/feed", func(w http.ResponseWriter, r *http.Request) {
+		log.Printf("→ %s %s (ad fields should be stripped)", r.Method, r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"data": map[string]interface{}{
+				"statuses": []map[string]string{
+					{"text": "hello world", "user": "test_user"},
+					{"text": "good morning", "user": "test_user2"},
+				},
+				"ad_list": []map[string]interface{}{
+					{"id": 1, "type": "feed_ad", "image": "https://ad.example.com/1.jpg"},
+					{"id": 2, "type": "feed_ad", "image": "https://ad.example.com/2.jpg"},
+				},
+				"splash_ad": map[string]string{
+					"url": "https://ad.example.com/splash.jpg",
+				},
+			},
+		})
+	})
+
+	// 正常内容（不应被拦截）
+	mux.HandleFunc("/normal", func(w http.ResponseWriter, r *http.Request) {
+		log.Printf("→ %s %s (should pass through)", r.Method, r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"message": "this is normal content",
+			"status":  "ok",
+		})
+	})
+
+	// 健康检查
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	})
+
+	addr := fmt.Sprintf("0.0.0.0:%s", port)
+	log.Printf("Ad server listening on %s", addr)
+	log.Fatal(http.ListenAndServe(addr, mux))
+}

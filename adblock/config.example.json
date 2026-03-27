@@ -1,0 +1,16 @@
+{
+  "enabled": true,
+
+  "ruleUrls": [
+    "https://raw.githubusercontent.com/ddgksf2013/Rewrite/master/AdBlock/StartUp.conf",
+    "https://raw.githubusercontent.com/ddgksf2013/Rewrite/master/AdBlock/Weibo.conf",
+    "https://raw.githubusercontent.com/ddgksf2013/Rewrite/master/AdBlock/Bilibili.conf",
+    "https://raw.githubusercontent.com/limbopro/Adblock4limbo/main/Adblock4limbo.conf"
+  ],
+
+  "ruleDir": "/var/lib/tailscale/adblock/rules",
+  "updateInterval": 3600,
+
+  "caKeyPath": "/var/lib/tailscale/adblock/ca.key",
+  "caCertPath": "/var/lib/tailscale/adblock/ca.pem"
+}

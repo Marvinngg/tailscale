@@ -50,8 +50,32 @@ type ConfigVAlpha struct {
 	// should advertise amongst its wireguard endpoints.
 	StaticEndpoints []netip.AddrPort `json:",omitempty"`
 
+	// Adblock 广告拦截引擎配置。
+	Adblock *AdblockConfig `json:",omitempty"`
+
 	// TODO(bradfitz,maisem): future something like:
 	// Profile map[string]*Config // keyed by alice@gmail.com, corp.com (TailnetSID)
+}
+
+// AdblockConfig 广告拦截引擎配置。
+type AdblockConfig struct {
+	// Enabled 是否启用。默认 false。
+	Enabled opt.Bool `json:",omitempty"`
+
+	// RuleURLs 规则订阅 URL 列表（Surge .sgmodule 或 QX .conf 格式）。
+	RuleURLs []string `json:",omitempty"`
+
+	// RuleDir 本地规则文件目录。
+	RuleDir string `json:",omitempty"`
+
+	// UpdateInterval 规则更新间隔（秒）。默认 3600。
+	UpdateInterval int `json:",omitempty"`
+
+	// CAKeyPath CA 私钥路径。首次运行时自动生成。
+	CAKeyPath string `json:",omitempty"`
+
+	// CACertPath CA 证书路径。
+	CACertPath string `json:",omitempty"`
 }
 
 func (c *ConfigVAlpha) ToPrefs() (MaskedPrefs, error) {
