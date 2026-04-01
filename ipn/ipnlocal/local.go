@@ -5596,6 +5596,15 @@ func (b *LocalBackend) collectBypassRoutesLocked(prefs ipn.PrefsView) []netip.Pr
 		}
 	}
 
+	// Local LAN subnets: auto-detected from physical interfaces.
+	// Without this, /1 tunnel routes capture LAN traffic, breaking
+	// direct peer connections and local network access.
+	if _, externalIPs, err := internalAndExternalInterfaces(); err == nil {
+		for _, p := range externalIPs {
+			add(p)
+		}
+	}
+
 	// Built-in bypass subnets: these always go through the physical
 	// network, not the exit node tunnel.
 	for _, cidr := range []string{
