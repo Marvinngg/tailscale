@@ -264,6 +264,7 @@ change in the future.
 			versionCmd,
 			nilOrCall(maybeWebCmd),
 			nilOrCall(fileCmd),
+			fsCmd,
 			bugReportCmd,
 			nilOrCall(maybeCertCmd),
 			nilOrCall(maybeNetlockCmd),

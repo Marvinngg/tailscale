@@ -399,12 +399,10 @@ func (e *Extension) taildropTargetStatus(p tailcfg.NodeView, nb ipnext.NodeBacke
 	if p.Hostinfo().OS() == "tvOS" {
 		return ipnstate.TaildropTargetUnsupportedOS
 	}
-	if selfUID != p.User() {
-		// Different user must have the explicit file sharing target capability
-		if !nb.PeerHasCap(p, tailcfg.PeerCapabilityFileSharingTarget) {
-			return ipnstate.TaildropTargetOwnedByOtherUser
-		}
-	}
+	// Original Tailscale restricts cross-user file sharing.
+	// We allow all peers in the tailnet to share files.
+	// Access control is handled at the network level via ACL.
+	_ = selfUID
 	if !nb.PeerHasPeerAPI(p) {
 		return ipnstate.TaildropTargetNoPeerAPI
 	}

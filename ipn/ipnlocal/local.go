@@ -5537,7 +5537,93 @@ func (b *LocalBackend) routerConfigLocked(cfg *wgcfg.Config, prefs ipn.PrefsView
 		rs.Routes = append(rs.Routes, netip.PrefixFrom(tsaddr.TailscaleServiceIPv6(), 128))
 	}
 
+	// On macOS (no fwmark), collect bypass routes so tunnel routes
+	// don't capture VPN infrastructure traffic.
+	if runtime.GOOS == "darwin" && (prefs.ExitNodeID() != "" || prefs.ExitNodeIP().IsValid()) {
+		rs.BypassRoutes = b.collectBypassRoutesLocked(prefs)
+	}
+
 	return rs
+}
+
+// collectBypassRoutesLocked returns prefixes that must bypass the tunnel:
+// control plane IP, DERP relay IPs, and user-configured subnets from
+// /Library/Tailscale/bypass-routes.
+func (b *LocalBackend) collectBypassRoutesLocked(prefs ipn.PrefsView) []netip.Prefix {
+	seen := map[netip.Prefix]bool{}
+	var routes []netip.Prefix
+	add := func(p netip.Prefix) {
+		if !seen[p] {
+			seen[p] = true
+			routes = append(routes, p)
+		}
+	}
+	addIP := func(s string) {
+		if ip, err := netip.ParseAddr(s); err == nil {
+			bits := 32
+			if ip.Is6() {
+				bits = 128
+			}
+			add(netip.PrefixFrom(ip, bits))
+		}
+	}
+
+	// Control plane IP.
+	controlURL := prefs.ControlURLOrDefault(b.polc)
+	if u, err := url.Parse(controlURL); err == nil {
+		host := u.Hostname()
+		if _, err := netip.ParseAddr(host); err != nil {
+			// hostname, resolve it
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			if ips, err := net.DefaultResolver.LookupHost(ctx, host); err == nil {
+				for _, s := range ips {
+					addIP(s)
+				}
+			}
+		} else {
+			addIP(host)
+		}
+	}
+
+	// DERP relay IPs from netmap.
+	if nm := b.currentNode().NetMap(); nm != nil && nm.DERPMap != nil {
+		for _, region := range nm.DERPMap.Regions {
+			for _, node := range region.Nodes {
+				addIP(node.IPv4)
+				addIP(node.IPv6)
+			}
+		}
+	}
+
+	// Built-in bypass subnets: these always go through the physical
+	// network, not the exit node tunnel.
+	for _, cidr := range []string{
+		"114.0.0.0/8",   // China Telecom / local ISP
+		"198.18.0.0/15", // Clash TUN fake-IP range
+	} {
+		if p, err := netip.ParsePrefix(cidr); err == nil {
+			add(p)
+		}
+	}
+
+	// Additional user-configured bypass routes.
+	if data, err := os.ReadFile("/Library/Tailscale/bypass-routes"); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			if p, err := netip.ParsePrefix(line); err == nil {
+				add(p)
+			}
+		}
+	}
+
+	if len(routes) > 0 {
+		b.logf("bypass routes: %d entries (control + DERP + user)", len(routes))
+	}
+	return routes
 }
 
 func unmapIPPrefix(ipp netip.Prefix) netip.Prefix {

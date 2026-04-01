@@ -26,7 +26,7 @@ func DefaultTailscaledSocket() string {
 		return `\\.\pipe\ProtectedPrefix\Administrators\Tailscale\tailscaled`
 	}
 	if runtime.GOOS == "darwin" {
-		return "/var/run/tailscaled.socket"
+		return "/var/run/tailscale/tailscaled.sock"
 	}
 	if runtime.GOOS == "plan9" {
 		return "/srv/tailscaled.sock"

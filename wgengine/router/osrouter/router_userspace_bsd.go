@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"os/exec"
 	"runtime"
+	"strings"
 
 	"github.com/tailscale/wireguard-go/tun"
 	"go4.org/netipx"
@@ -29,12 +30,13 @@ func init() {
 }
 
 type userspaceBSDRouter struct {
-	logf    logger.Logf
-	netMon  *netmon.Monitor
-	health  *health.Tracker
-	tunname string
-	local   []netip.Prefix
-	routes  map[netip.Prefix]bool
+	logf         logger.Logf
+	netMon       *netmon.Monitor
+	health       *health.Tracker
+	tunname      string
+	local        []netip.Prefix
+	routes       map[netip.Prefix]bool
+	bypassRoutes map[netip.Prefix]bool // /32 or subnet routes via physical gateway
 }
 
 func newUserspaceBSDRouter(logf logger.Logf, tundev tun.Device, netMon *netmon.Monitor, health *health.Tracker) (router.Router, error) {
@@ -106,6 +108,26 @@ func inet(p netip.Prefix) string {
 	return "inet"
 }
 
+// defaultGateway returns the system's default gateway IP for the given
+// address family (4 or 6) by parsing "route -n get default" output.
+func defaultGateway(family int) string {
+	args := []string{"route", "-n", "get", "default"}
+	if family == 6 {
+		args = []string{"route", "-n", "get", "-inet6", "default"}
+	}
+	out, err := cmd(args...).CombinedOutput()
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "gateway:") {
+			return strings.TrimSpace(line[len("gateway:"):])
+		}
+	}
+	return ""
+}
+
 func (r *userspaceBSDRouter) Set(cfg *router.Config) (reterr error) {
 	if cfg == nil {
 		cfg = &shutdownConfig
@@ -150,8 +172,40 @@ func (r *userspaceBSDRouter) Set(cfg *router.Config) (reterr error) {
 		}
 	}
 
+	// On macOS, "route add 0.0.0.0/0" fails with EEXIST when a default
+	// route already exists. Split /0 into two /1 routes that override
+	// the default without conflicting.
+	cfgRoutes := cfg.Routes
+	if runtime.GOOS == "darwin" {
+		var out []netip.Prefix
+		for _, r := range cfgRoutes {
+			if r.Bits() == 0 {
+				if r.Addr().Is4() {
+					out = append(out,
+						netip.MustParsePrefix("0.0.0.0/1"),
+						netip.MustParsePrefix("128.0.0.0/1"))
+				} else {
+					out = append(out,
+						netip.MustParsePrefix("::/1"),
+						netip.MustParsePrefix("8000::/1"))
+				}
+			} else {
+				out = append(out, r)
+			}
+		}
+		cfgRoutes = out
+	}
+
+	// On macOS, add bypass routes via the physical gateway BEFORE
+	// installing tunnel routes. These more-specific routes ensure
+	// control plane, DERP, and user-configured subnets remain
+	// reachable when /1 tunnel routes capture all traffic.
+	if runtime.GOOS == "darwin" {
+		r.setBypassRoutes(cfg.BypassRoutes)
+	}
+
 	newRoutes := make(map[netip.Prefix]bool)
-	for _, route := range cfg.Routes {
+	for _, route := range cfgRoutes {
 		if runtime.GOOS != "darwin" && route == tsaddr.TailscaleULARange() {
 			// Because we added the interface address as a /48 above,
 			// the kernel already created the Tailscale ULA route
@@ -206,6 +260,77 @@ func (r *userspaceBSDRouter) Set(cfg *router.Config) (reterr error) {
 	return reterr
 }
 
+// setBypassRoutes manages routes that bypass the tunnel via the physical
+// default gateway. Called before tunnel routes are written so that
+// more-specific bypass routes take precedence over /1 tunnel routes.
+func (r *userspaceBSDRouter) setBypassRoutes(wanted []netip.Prefix) {
+	del := "delete"
+	if version.OS() != "macOS" {
+		del = "del"
+	}
+
+	newBypass := make(map[netip.Prefix]bool, len(wanted))
+	for _, p := range wanted {
+		newBypass[p] = true
+	}
+
+	// Remove stale bypass routes.
+	for route := range r.bypassRoutes {
+		if !newBypass[route] {
+			nstr := fmt.Sprintf("%v/%d", route.Masked().Addr(), route.Bits())
+			cmd("route", "-q", "-n", del, "-"+inet(route), nstr).CombinedOutput()
+		}
+	}
+
+	if len(newBypass) == 0 {
+		r.bypassRoutes = nil
+		return
+	}
+
+	// Determine gateways for each address family.
+	gw4 := defaultGateway(4)
+	gw6 := defaultGateway(6)
+	if gw4 == "" && gw6 == "" {
+		r.logf("bypass routes: no default gateway found")
+		r.bypassRoutes = newBypass
+		return
+	}
+
+	added := 0
+	for route := range newBypass {
+		if r.bypassRoutes[route] {
+			continue // already installed
+		}
+		gw := gw4
+		if route.Addr().Is6() {
+			gw = gw6
+		}
+		if gw == "" {
+			continue
+		}
+		nstr := fmt.Sprintf("%v/%d", route.Masked().Addr(), route.Bits())
+		flag := "-net"
+		if route.IsSingleIP() {
+			flag = "-host"
+			nstr = route.Addr().String()
+		}
+		out, err := cmd("route", "-q", "-n", "add", "-"+inet(route), flag, nstr, gw).CombinedOutput()
+		if err != nil {
+			r.logf("bypass route add %s via %s failed: %v\n%s", nstr, gw, err, out)
+		} else {
+			added++
+		}
+	}
+	if added > 0 {
+		r.logf("bypass routes: added %d via gw4=%s gw6=%s", added, gw4, gw6)
+	}
+	r.bypassRoutes = newBypass
+}
+
 func (r *userspaceBSDRouter) Close() error {
+	// Clean up bypass routes on shutdown.
+	if len(r.bypassRoutes) > 0 {
+		r.setBypassRoutes(nil)
+	}
 	return nil
 }

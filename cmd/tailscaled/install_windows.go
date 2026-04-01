@@ -43,11 +43,27 @@ func installSystemDaemonWindows(args []string) (err error) {
 
 	service, err := m.OpenService(serviceName)
 	if err == nil {
-		service.Close()
-		return fmt.Errorf("service %q is already installed", serviceName)
+		// Service exists. Check if it's functional.
+		st, sterr := service.Query()
+		if sterr != nil || st.State == svc.Stopped {
+			// Service is broken or stopped — delete and reinstall
+			service.Control(svc.Stop)
+			service.Delete()
+			service.Close()
+			// Wait for deletion to complete
+			for i := 0; i < 10; i++ {
+				if _, err := m.OpenService(serviceName); err != nil {
+					break
+				}
+				time.Sleep(500 * time.Millisecond)
+			}
+		} else {
+			service.Close()
+			return fmt.Errorf("service %q is already installed and running", serviceName)
+		}
 	}
 
-	// no such service; proceed to install the service.
+	// Proceed to install the service.
 
 	exe, err := os.Executable()
 	if err != nil {

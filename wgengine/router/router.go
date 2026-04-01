@@ -120,6 +120,14 @@ type Config struct {
 	// routing rules apply.
 	LocalRoutes []netip.Prefix
 
+	// BypassRoutes are prefixes that must remain reachable via the
+	// physical network when exit node routes are active. On macOS,
+	// the router adds host/subnet routes for these via the default
+	// gateway before installing tunnel routes. Automatically populated
+	// with control plane and DERP IPs; may also include user-configured
+	// subnets from /Library/Tailscale/bypass-routes.
+	BypassRoutes []netip.Prefix
+
 	// NewMTU is currently only used by the MacOS network extension
 	// app to set the MTU of the tun in the router configuration
 	// callback. If zero, the MTU is unchanged.
