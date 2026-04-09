@@ -100,24 +100,57 @@ func main() {
 	// Launch official GUI
 	exec.Command(filepath.Join(installDir, "tailscale-ipn.exe")).Start()
 
-	// Step 4: Verify
-	fmt.Println("  [4/4] Verifying...")
+	// Step 4: Auto-login if config file exists
+	fmt.Println("  [4/5] Connecting to network...")
+	configFile := filepath.Join(srcDir, "connect.conf")
+	var serverURL, authKey, exitNode string
+	if data, err := os.ReadFile(configFile); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "server=") {
+				serverURL = strings.TrimPrefix(line, "server=")
+			} else if strings.HasPrefix(line, "key=") {
+				authKey = strings.TrimPrefix(line, "key=")
+			} else if strings.HasPrefix(line, "exit-node=") {
+				exitNode = strings.TrimPrefix(line, "exit-node=")
+			}
+		}
+	}
+
+	if serverURL != "" && authKey != "" {
+		args := []string{"up", "--login-server=" + serverURL, "--auth-key=" + authKey, "--reset"}
+		if exitNode != "" {
+			args = append(args, "--exit-node="+exitNode)
+		}
+		fmt.Printf("  Connecting to %s ...\n", serverURL)
+		out, err = exec.Command(filepath.Join(installDir, "tailscale.exe"), args...).CombinedOutput()
+		if err != nil {
+			fmt.Printf("  Connect warning: %s\n", strings.TrimSpace(string(out)))
+		} else {
+			fmt.Println("  Connected!")
+		}
+		time.Sleep(3 * time.Second)
+	} else {
+		fmt.Println("  No connect.conf found. Manual setup needed:")
+		fmt.Println("    tailscale up --login-server=YOUR_SERVER --auth-key=YOUR_KEY")
+	}
+
+	// Step 5: Verify
+	fmt.Println("  [5/5] Verifying...")
 	out, _ = exec.Command(filepath.Join(installDir, "tailscale.exe"), "version").CombinedOutput()
 	ver := strings.TrimSpace(string(out))
 
-	out, _ = exec.Command("sc.exe", "query", "Tailscale").CombinedOutput()
-	running := strings.Contains(string(out), "RUNNING")
+	out, _ = exec.Command(filepath.Join(installDir, "tailscale.exe"), "status").CombinedOutput()
+	status := strings.TrimSpace(string(out))
 
 	fmt.Println()
 	fmt.Println("  ========================================")
-	if running {
-		fmt.Println("  Done!")
-	} else {
-		fmt.Println("  Warning: service may not be running")
-	}
 	fmt.Printf("  Version: %s\n", ver)
-	fmt.Println()
-	fmt.Println("  Connect: tailscale up --login-server=YOUR_SERVER --authkey=YOUR_KEY")
+	if strings.Contains(status, "offline") || strings.Contains(status, "stopped") {
+		fmt.Println("  Status:  NOT connected")
+	} else {
+		fmt.Println("  Status:  Connected")
+	}
 	fmt.Println("  ========================================")
 	wait()
 }
