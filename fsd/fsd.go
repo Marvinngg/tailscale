@@ -69,12 +69,6 @@ func (s *Service) Start(ctx context.Context) error {
 	os.MkdirAll(s.cfg.SharedDir, 0755)
 	os.MkdirAll(s.cfg.InboxDir, 0755)
 
-	// Wait for tailscaled to be ready and get our Tailnet IP
-	ip, err := s.waitForTailnetIP(ctx)
-	if err != nil {
-		return fmt.Errorf("fsd: waiting for tailnet IP: %w", err)
-	}
-
 	s.handlers = NewHandlers(s.cfg, &s.lc)
 
 	mux := http.NewServeMux()
@@ -86,28 +80,43 @@ func (s *Service) Start(ctx context.Context) error {
 		w.Write([]byte("ok"))
 	})
 
-	addr := fmt.Sprintf("%s:%d", ip, s.cfg.Port)
-	s.server = &http.Server{
-		Addr:    addr,
-		Handler: withAuth(&s.lc, mux),
+	// Retry loop: wait for Tailnet IP and bind, retrying if the IP
+	// isn't yet assigned to the tun interface.
+	for {
+		ip, err := s.waitForTailnetIP(ctx)
+		if err != nil {
+			return fmt.Errorf("fsd: %w", err)
+		}
+
+		addr := fmt.Sprintf("%s:%d", ip, s.cfg.Port)
+		s.server = &http.Server{
+			Addr:    addr,
+			Handler: withAuth(&s.lc, mux),
+		}
+
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			log.Printf("fsd: listen %s: %v, retrying in 3s...", addr, err)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(3 * time.Second):
+				continue
+			}
+		}
+
+		log.Printf("fsd: serving on %s (shared=%s, inbox=%s)", addr, s.cfg.SharedDir, s.cfg.InboxDir)
+
+		go func() {
+			<-ctx.Done()
+			s.server.Close()
+		}()
+
+		if err := s.server.Serve(ln); err != nil && err != http.ErrServerClosed {
+			return err
+		}
+		return nil
 	}
-
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		return fmt.Errorf("fsd: listen %s: %w", addr, err)
-	}
-
-	log.Printf("fsd: serving on %s (shared=%s, inbox=%s)", addr, s.cfg.SharedDir, s.cfg.InboxDir)
-
-	go func() {
-		<-ctx.Done()
-		s.server.Close()
-	}()
-
-	if err := s.server.Serve(ln); err != nil && err != http.ErrServerClosed {
-		return err
-	}
-	return nil
 }
 
 // waitForTailnetIP polls tailscaled until we have a Tailnet IP.

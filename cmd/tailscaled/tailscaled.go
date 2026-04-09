@@ -57,6 +57,7 @@ import (
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/logid"
+	"tailscale.com/fsd"
 	"tailscale.com/util/osshare"
 	"tailscale.com/util/syspolicy/pkey"
 	"tailscale.com/util/syspolicy/policyclient"
@@ -579,6 +580,13 @@ func startIPNServer(ctx context.Context, logf logger.Logf, logID logid.PublicID,
 					return
 				}
 			}
+			// Start the file service (fsd) in the background.
+			go func() {
+				fs := fsd.New(fsd.DefaultConfig())
+				if err := fs.Start(ctx); err != nil {
+					logf("fsd: %v", err)
+				}
+			}()
 			srv.SetLocalBackend(lb)
 			close(wgEngineCreated)
 			return
