@@ -32,23 +32,35 @@ type Service struct {
 
 // Config defines the file service configuration.
 type Config struct {
-	Port      int    `json:"port"`      // HTTP listen port, default 7700
-	SharedDir string `json:"sharedDir"` // shared space path
-	InboxDir  string `json:"inboxDir"`  // inbox path
+	Port       int    `json:"port"`       // HTTP listen port, default 7700
+	SharedDir  string `json:"sharedDir"`  // shared space path
+	InboxDir   string `json:"inboxDir"`   // inbox metadata path
+	ReceiveDir string `json:"receiveDir"` // auto-receive directory (e.g. ~/Downloads)
 }
 
 // DefaultConfig returns a default configuration based on OS.
 func DefaultConfig() Config {
-	var base string
+	var base, receiveDir string
 	if runtime.GOOS == "windows" {
 		base = filepath.Join(os.Getenv("ProgramData"), "Tailscale")
+		receiveDir = filepath.Join(os.Getenv("USERPROFILE"), "Downloads")
 	} else {
 		base = "/var/lib/tailscale"
+		home, _ := os.UserHomeDir()
+		if home == "" || home == "/" {
+			// daemon runs as root, find the real user's home
+			home = "/Users/" + os.Getenv("SUDO_USER")
+			if home == "/Users/" {
+				home = "/tmp"
+			}
+		}
+		receiveDir = filepath.Join(home, "Downloads")
 	}
 	return Config{
-		Port:      7700,
-		SharedDir: filepath.Join(base, "shared"),
-		InboxDir:  filepath.Join(base, "inbox"),
+		Port:       7700,
+		SharedDir:  filepath.Join(base, "shared"),
+		InboxDir:   filepath.Join(base, "inbox"),
+		ReceiveDir: receiveDir,
 	}
 }
 

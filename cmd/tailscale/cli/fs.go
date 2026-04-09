@@ -288,8 +288,8 @@ func runFsLs(ctx context.Context, args []string) error {
 
 var fsInboxCmd = &ffcli.Command{
 	Name:       "inbox",
-	ShortUsage: "tailscale fs inbox [get <file>]",
-	ShortHelp:  "List or retrieve inbox files",
+	ShortUsage: "tailscale fs inbox",
+	ShortHelp:  "List received files (auto-saved to Downloads)",
 	Exec:       runFsInbox,
 }
 
@@ -303,23 +303,6 @@ func runFsInbox(ctx context.Context, args []string) error {
 	}
 	myIP := st.TailscaleIPs[0].String()
 
-	if len(args) >= 2 && args[0] == "get" {
-		// Download inbox file
-		fileName := args[1]
-		url := fmt.Sprintf("http://%s:%d/inbox/%s", myIP, fsdPort, fileName)
-		resp, err := http.Get(url)
-		if err != nil {
-			return err
-		}
-		defer resp.Body.Close()
-		f, _ := os.Create(fileName)
-		defer f.Close()
-		n, _ := io.Copy(f, resp.Body)
-		fmt.Printf("  saved %s (%d bytes)\n", fileName, n)
-		return nil
-	}
-
-	// List inbox
 	url := fmt.Sprintf("http://%s:%d/inbox", myIP, fsdPort)
 	resp, err := http.Get(url)
 	if err != nil {
@@ -328,19 +311,23 @@ func runFsInbox(ctx context.Context, args []string) error {
 	defer resp.Body.Close()
 
 	var entries []struct {
-		Name string `json:"name"`
+		File string `json:"file"`
 		Size int64  `json:"size"`
+		From string `json:"from"`
+		Time string `json:"time"`
+		Path string `json:"path"`
 	}
 	json.NewDecoder(resp.Body).Decode(&entries)
 
 	if len(entries) == 0 {
-		fmt.Println("  inbox is empty")
+		fmt.Println("  no received files")
 		return nil
 	}
 
 	tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintf(tw, "  FILE\tSIZE\tFROM\tSAVED TO\n")
 	for _, e := range entries {
-		fmt.Fprintf(tw, "  %s\t%d bytes\n", e.Name, e.Size)
+		fmt.Fprintf(tw, "  %s\t%d\t%s\t%s\n", e.File, e.Size, e.From, e.Path)
 	}
 	tw.Flush()
 	return nil

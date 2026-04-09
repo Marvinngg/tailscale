@@ -19,6 +19,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
@@ -582,7 +583,19 @@ func startIPNServer(ctx context.Context, logf logger.Logf, logID logid.PublicID,
 			}
 			// Start the file service (fsd) in the background.
 			go func() {
-				fs := fsd.New(fsd.DefaultConfig())
+				cfg := fsd.DefaultConfig()
+				// On macOS, daemon runs as root but files should go to
+				// the real user's Downloads. Detect via console user.
+				if runtime.GOOS == "darwin" {
+					if out, err := exec.Command("stat", "-f", "%Su", "/dev/console").Output(); err == nil {
+						user := strings.TrimSpace(string(out))
+						if user != "" && user != "root" {
+							cfg.ReceiveDir = "/Users/" + user + "/Downloads"
+						}
+					}
+				}
+				logf("fsd: receive dir: %s", cfg.ReceiveDir)
+				fs := fsd.New(cfg)
 				if err := fs.Start(ctx); err != nil {
 					logf("fsd: %v", err)
 				}

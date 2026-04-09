@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"tailscale.com/client/tailscale"
 )
@@ -128,18 +129,15 @@ func (h *Handlers) deleteFile(w http.ResponseWriter, r *http.Request, path strin
 	json.NewEncoder(w).Encode(map[string]string{"status": "deleted"})
 }
 
-// HandleInbox handles GET /inbox and GET /inbox/{file}
+// HandleInbox handles GET /inbox and PUT /inbox/{file}
+//
+// PUT: receives a file from another node's /send, saves directly to
+// ReceiveDir (e.g. ~/Downloads/) and records metadata in InboxDir.
+// GET: lists receive history (metadata), not the files themselves.
 func (h *Handlers) HandleInbox(w http.ResponseWriter, r *http.Request) {
 	subpath := strings.TrimPrefix(r.URL.Path, "/inbox")
 	subpath = strings.TrimPrefix(subpath, "/")
 
-	if subpath == "" {
-		// List inbox
-		h.listDir(w, h.cfg.InboxDir)
-		return
-	}
-
-	path := filepath.Join(h.cfg.InboxDir, filepath.Clean(subpath))
 	if strings.Contains(subpath, "..") {
 		http.Error(w, "invalid path", http.StatusBadRequest)
 		return
@@ -147,22 +145,111 @@ func (h *Handlers) HandleInbox(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
-		http.ServeFile(w, r, path)
+		if subpath == "" {
+			h.listInbox(w)
+		} else {
+			// Download from ReceiveDir if it exists there
+			path := filepath.Join(h.cfg.ReceiveDir, filepath.Clean(subpath))
+			http.ServeFile(w, r, path)
+		}
 	case http.MethodPut:
-		// Receiving a file from another node's /send
-		os.MkdirAll(h.cfg.InboxDir, 0755)
-		f, err := os.Create(path)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+		if subpath == "" {
+			http.Error(w, "filename required", http.StatusBadRequest)
 			return
 		}
-		defer f.Close()
-		io.Copy(f, r.Body)
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"status": "received"})
+		h.receiveFile(w, r, subpath)
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+// receiveFile saves the uploaded file directly to ReceiveDir and writes
+// a metadata entry to InboxDir.
+func (h *Handlers) receiveFile(w http.ResponseWriter, r *http.Request, fileName string) {
+	fileName = filepath.Clean(fileName)
+
+	// Save file to ReceiveDir (e.g. ~/Downloads/file.txt)
+	os.MkdirAll(h.cfg.ReceiveDir, 0755)
+	destPath := filepath.Join(h.cfg.ReceiveDir, fileName)
+
+	// Handle name collision: append (1), (2), etc.
+	if _, err := os.Stat(destPath); err == nil {
+		ext := filepath.Ext(fileName)
+		base := strings.TrimSuffix(fileName, ext)
+		for i := 1; ; i++ {
+			destPath = filepath.Join(h.cfg.ReceiveDir, fmt.Sprintf("%s(%d)%s", base, i, ext))
+			if _, err := os.Stat(destPath); os.IsNotExist(err) {
+				break
+			}
+		}
+	}
+
+	f, err := os.Create(destPath)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("create file: %v", err), http.StatusInternalServerError)
+		return
+	}
+	defer f.Close()
+
+	n, err := io.Copy(f, r.Body)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("write: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Record metadata in InboxDir for history
+	sender := r.Header.Get("X-Sender")
+	if sender == "" {
+		sender = r.RemoteAddr
+	}
+	os.MkdirAll(h.cfg.InboxDir, 0755)
+	meta := fmt.Sprintf(`{"file":"%s","size":%d,"from":"%s","time":"%s","path":"%s"}`,
+		fileName, n, sender, time.Now().Format(time.RFC3339), destPath)
+	metaFile := filepath.Join(h.cfg.InboxDir, fileName+".json")
+	os.WriteFile(metaFile, []byte(meta), 0644)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status": "received",
+		"path":   destPath,
+		"size":   n,
+	})
+}
+
+// listInbox reads metadata files from InboxDir and returns receive history.
+func (h *Handlers) listInbox(w http.ResponseWriter) {
+	entries, err := os.ReadDir(h.cfg.InboxDir)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode([]interface{}{})
+		return
+	}
+
+	type inboxEntry struct {
+		File string `json:"file"`
+		Size int64  `json:"size"`
+		From string `json:"from"`
+		Time string `json:"time"`
+		Path string `json:"path"`
+	}
+
+	var result []inboxEntry
+	for _, e := range entries {
+		if !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(h.cfg.InboxDir, e.Name()))
+		if err != nil {
+			continue
+		}
+		var entry inboxEntry
+		if json.Unmarshal(data, &entry) == nil {
+			result = append(result, entry)
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(result)
 }
 
 // HandleSend handles POST /send
