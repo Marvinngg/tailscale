@@ -25,24 +25,37 @@ func NewHandlers(cfg Config, lc *tailscale.LocalClient) *Handlers {
 
 // HandleFiles handles GET/PUT/DELETE on /files/{path}
 func (h *Handlers) HandleFiles(w http.ResponseWriter, r *http.Request) {
-	// /files/shared/foo.txt → subpath = shared/foo.txt
 	subpath := strings.TrimPrefix(r.URL.Path, "/files/")
 	subpath = filepath.Clean(subpath)
 
-	// Prevent path traversal
 	if strings.Contains(subpath, "..") {
 		http.Error(w, "invalid path", http.StatusBadRequest)
 		return
 	}
 
+	_, _, role := CallerInfo(r)
+	acl := GetACL()
+
 	localPath := filepath.Join(h.cfg.SharedDir, subpath)
 
 	switch r.Method {
 	case http.MethodGet:
+		if acl != nil && !acl.CanAccessLibrary(role, subpath) {
+			http.Error(w, "permission denied", http.StatusForbidden)
+			return
+		}
 		h.getFile(w, r, localPath)
 	case http.MethodPut:
+		if acl != nil && !acl.CanUploadLibrary(role) {
+			http.Error(w, "permission denied: cannot upload", http.StatusForbidden)
+			return
+		}
 		h.putFile(w, r, localPath)
 	case http.MethodDelete:
+		if acl != nil && !acl.CanDeleteLibrary(role) {
+			http.Error(w, "permission denied: cannot delete", http.StatusForbidden)
+			return
+		}
 		h.deleteFile(w, r, localPath)
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -269,6 +282,42 @@ func (h *Handlers) HandleSend(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, fmt.Sprintf("invalid request: %v", err), http.StatusBadRequest)
 		return
+	}
+
+	results, err := Send(r.Context(), h.lc, h.cfg, req)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(results)
+}
+
+// HandleBroadcast handles POST /broadcast
+// Sends a file from the shared library to all online nodes or a specific group.
+func (h *Handlers) HandleBroadcast(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+
+	_, _, role := CallerInfo(r)
+	acl := GetACL()
+	if acl != nil && !acl.CanBroadcast(role) {
+		http.Error(w, "permission denied: cannot broadcast", http.StatusForbidden)
+		return
+	}
+
+	var req SendRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf("invalid request: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	// Default to "all" if no group specified
+	if req.Group == "" && len(req.Targets) == 0 {
+		req.Group = "all"
 	}
 
 	results, err := Send(r.Context(), h.lc, h.cfg, req)

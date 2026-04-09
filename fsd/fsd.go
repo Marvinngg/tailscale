@@ -89,8 +89,22 @@ func (s *Service) Start(ctx context.Context) error {
 	mux.HandleFunc("/send", s.handlers.HandleSend)
 	mux.HandleFunc("/inbox", s.handlers.HandleInbox)
 	mux.HandleFunc("/inbox/", s.handlers.HandleInbox)
+	mux.HandleFunc("/broadcast", s.handlers.HandleBroadcast)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok"))
+	})
+	mux.HandleFunc("/acl/reload", func(w http.ResponseWriter, r *http.Request) {
+		_, _, role := CallerInfo(r)
+		if role != "admin" {
+			http.Error(w, "admin only", http.StatusForbidden)
+			return
+		}
+		acl := ReloadACL()
+		if acl == nil {
+			w.Write([]byte(`{"status":"no acl file"}`))
+		} else {
+			w.Write([]byte(`{"status":"reloaded"}`))
+		}
 	})
 
 	// Retry loop: wait for Tailnet IP and bind, retrying if the IP

@@ -23,13 +23,14 @@ const fsdPort = 7700
 var fsCmd = &ffcli.Command{
 	Name:       "fs",
 	ShortUsage: "tailscale fs <subcommand>",
-	ShortHelp:  "File service: send, get, list, inbox",
+	ShortHelp:  "File service: send, get, list, inbox, broadcast",
 	Subcommands: []*ffcli.Command{
 		fsSendCmd,
 		fsGetCmd,
 		fsLsCmd,
 		fsPutCmd,
 		fsInboxCmd,
+		fsBroadcastCmd,
 	},
 	Exec: func(ctx context.Context, args []string) error {
 		return flag.ErrHelp
@@ -401,4 +402,73 @@ func matchNode(hostName, dnsName, target string) bool {
 		}
 	}
 	return false
+}
+
+// --- broadcast ---
+
+var fsBroadcastCmd = &ffcli.Command{
+	Name:       "broadcast",
+	ShortUsage: "tailscale fs broadcast <file> [--group=<group>]",
+	ShortHelp:  "Send a file to all online nodes (or a specific group)",
+	Exec:       runFsBroadcast,
+}
+
+func runFsBroadcast(ctx context.Context, args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: tailscale fs broadcast <file> [--group=<group>]")
+	}
+
+	filePath := args[0]
+	group := "all"
+	for _, arg := range args[1:] {
+		if strings.HasPrefix(arg, "--group=") {
+			group = strings.TrimPrefix(arg, "--group=")
+		}
+	}
+
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", filePath, err)
+	}
+
+	st, err := localClient.Status(ctx)
+	if err != nil {
+		return err
+	}
+	if len(st.TailscaleIPs) == 0 {
+		return fmt.Errorf("not connected")
+	}
+	myIP := st.TailscaleIPs[0].String()
+
+	// Send via local fsd's /broadcast endpoint
+	body := map[string]interface{}{
+		"file":  filePath,
+		"group": group,
+	}
+	reqBody, _ := json.Marshal(body)
+	url := fmt.Sprintf("http://%s:%d/broadcast", myIP, fsdPort)
+	resp, err := http.Post(url, "application/json", bytes.NewReader(reqBody))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusForbidden {
+		return fmt.Errorf("permission denied: your role cannot broadcast")
+	}
+
+	var results []struct {
+		Target string `json:"target"`
+		Status string `json:"status"`
+	}
+	json.NewDecoder(resp.Body).Decode(&results)
+
+	fileName := filepath.Base(filePath)
+	fmt.Printf("  broadcast %s to %s:\n", fileName, group)
+	for _, r := range results {
+		fmt.Printf("    %s: %s\n", r.Target, r.Status)
+	}
+
+	_ = data // file read by fsd from path
+	return nil
 }
