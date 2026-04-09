@@ -143,21 +143,32 @@ func resolveGroup(ctx context.Context, lc *tailscale.LocalClient, group string) 
 }
 
 // resolveNodeIP returns the Tailnet IP for a node hostname.
+// Prefers online nodes when multiple share the same name.
 func resolveNodeIP(ctx context.Context, lc *tailscale.LocalClient, hostname string) (string, error) {
 	st, err := lc.Status(ctx)
 	if err != nil {
 		return "", err
 	}
 
+	hostname = strings.ToLower(hostname)
+	var fallbackIP string
 	for _, peer := range st.Peer {
-		if peer.HostName == hostname || peer.DNSName == hostname ||
-			trimDot(peer.DNSName) == hostname {
+		hn := strings.ToLower(peer.HostName)
+		dn := strings.ToLower(trimDot(peer.DNSName))
+		if hn == hostname || dn == hostname {
 			if len(peer.TailscaleIPs) > 0 {
-				return peer.TailscaleIPs[0].String(), nil
+				if peer.Online {
+					return peer.TailscaleIPs[0].String(), nil
+				}
+				if fallbackIP == "" {
+					fallbackIP = peer.TailscaleIPs[0].String()
+				}
 			}
 		}
 	}
-
+	if fallbackIP != "" {
+		return fallbackIP, nil
+	}
 	return "", fmt.Errorf("node %q not found", hostname)
 }
 

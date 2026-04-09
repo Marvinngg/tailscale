@@ -584,14 +584,34 @@ func startIPNServer(ctx context.Context, logf logger.Logf, logID logid.PublicID,
 			// Start the file service (fsd) in the background.
 			go func() {
 				cfg := fsd.DefaultConfig()
-				// On macOS, daemon runs as root but files should go to
-				// the real user's Downloads. Detect via console user.
-				if runtime.GOOS == "darwin" {
+				// Daemon runs as root/SYSTEM, detect the real logged-in
+				// user so files go to their Downloads, not root's.
+				switch runtime.GOOS {
+				case "darwin":
 					if out, err := exec.Command("stat", "-f", "%Su", "/dev/console").Output(); err == nil {
-						user := strings.TrimSpace(string(out))
-						if user != "" && user != "root" {
+						if user := strings.TrimSpace(string(out)); user != "" && user != "root" {
 							cfg.ReceiveDir = "/Users/" + user + "/Downloads"
 						}
+					}
+				case "windows":
+					// Find the most recently modified user profile under C:\Users.
+					// The daemon runs as SYSTEM, so we scan for real user dirs.
+					entries, _ := os.ReadDir(`C:\Users`)
+					var bestDir string
+					var bestTime time.Time
+					skip := map[string]bool{"Public": true, "Default": true, "Default User": true, "All Users": true}
+					for _, e := range entries {
+						if !e.IsDir() || skip[e.Name()] || strings.HasPrefix(e.Name(), ".") || strings.HasSuffix(e.Name(), "$") {
+							continue
+						}
+						dlDir := filepath.Join(`C:\Users`, e.Name(), "Downloads")
+						if info, err := os.Stat(dlDir); err == nil && info.ModTime().After(bestTime) {
+							bestTime = info.ModTime()
+							bestDir = dlDir
+						}
+					}
+					if bestDir != "" {
+						cfg.ReceiveDir = bestDir
 					}
 				}
 				logf("fsd: receive dir: %s", cfg.ReceiveDir)

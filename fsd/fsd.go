@@ -43,7 +43,8 @@ func DefaultConfig() Config {
 	var base, receiveDir string
 	if runtime.GOOS == "windows" {
 		base = filepath.Join(os.Getenv("ProgramData"), "Tailscale")
-		receiveDir = filepath.Join(os.Getenv("USERPROFILE"), "Downloads")
+		// Default; overridden by tailscaled.go with the real user's path.
+		receiveDir = filepath.Join(base, "received")
 	} else {
 		base = "/var/lib/tailscale"
 		home, _ := os.UserHomeDir()

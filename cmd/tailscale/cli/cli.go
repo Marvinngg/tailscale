@@ -211,6 +211,7 @@ func noDupFlagify(c *ffcli.Command) {
 
 var (
 	fileCmd,
+	voiceCmd,
 	sysPolicyCmd,
 	maybeWebCmd,
 	maybeDriveCmd,
@@ -264,6 +265,7 @@ change in the future.
 			versionCmd,
 			nilOrCall(maybeWebCmd),
 			nilOrCall(fileCmd),
+			nilOrCall(voiceCmd),
 			fsCmd,
 			bugReportCmd,
 			nilOrCall(maybeCertCmd),

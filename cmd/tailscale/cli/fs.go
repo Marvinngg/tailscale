@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -345,35 +346,41 @@ func parseNodePath(ctx context.Context, s string) (node, path string) {
 }
 
 func resolveTarget(ctx context.Context, name string) (string, error) {
-	st, err := localClient.Status(ctx)
-	if err != nil {
-		return "", err
-	}
-
-	if name == "localhost" || name == "" {
+	if name == "" || name == "localhost" {
+		st, err := localClient.Status(ctx)
+		if err != nil {
+			return "", err
+		}
 		if len(st.TailscaleIPs) > 0 {
 			return st.TailscaleIPs[0].String(), nil
 		}
 		return "127.0.0.1", nil
 	}
 
-	// Check self
-	if st.Self != nil {
-		if matchNode(st.Self.HostName, st.Self.DNSName, name) {
-			if len(st.TailscaleIPs) > 0 {
-				return st.TailscaleIPs[0].String(), nil
+	// If it's already an IP, use it directly.
+	if net.ParseIP(name) != nil {
+		return name, nil
+	}
+
+	// Otherwise resolve by hostname, prefer online nodes.
+	st, err := localClient.Status(ctx)
+	if err != nil {
+		return "", err
+	}
+	name = strings.ToLower(name)
+	var fallbackIP string
+	for _, p := range st.Peer {
+		if matchNode(p.HostName, p.DNSName, name) && len(p.TailscaleIPs) > 0 {
+			if p.Online {
+				return p.TailscaleIPs[0].String(), nil
+			}
+			if fallbackIP == "" {
+				fallbackIP = p.TailscaleIPs[0].String()
 			}
 		}
 	}
-
-	// Check peers
-	name = strings.ToLower(name)
-	for _, p := range st.Peer {
-		if matchNode(p.HostName, p.DNSName, name) {
-			if len(p.TailscaleIPs) > 0 {
-				return p.TailscaleIPs[0].String(), nil
-			}
-		}
+	if fallbackIP != "" {
+		return fallbackIP, nil
 	}
 	return "", fmt.Errorf("node %q not found in tailnet", name)
 }
