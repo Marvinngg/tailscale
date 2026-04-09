@@ -7,51 +7,103 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
-	"time"
 	"unsafe"
 )
 
 var (
-	user32              = syscall.NewLazyDLL("user32.dll")
-	procRegisterHotKey  = user32.NewProc("RegisterHotKey")
-	procGetMessage      = user32.NewProc("GetMessageW")
-	procUnregisterHotKey = user32.NewProc("UnregisterHotKey")
+	user32                  = syscall.NewLazyDLL("user32.dll")
+	kernel32                = syscall.NewLazyDLL("kernel32.dll")
+	procSetWindowsHookEx    = user32.NewProc("SetWindowsHookExW")
+	procUnhookWindowsHookEx = user32.NewProc("UnhookWindowsHookEx")
+	procCallNextHookEx      = user32.NewProc("CallNextHookEx")
+	procGetMessage          = user32.NewProc("GetMessageW")
+	procPostThreadMessage   = user32.NewProc("PostThreadMessageW")
+	procGetModuleHandle     = kernel32.NewProc("GetModuleHandleW")
+	procGetCurrentThreadId  = kernel32.NewProc("GetCurrentThreadId")
+	procSleep               = kernel32.NewProc("Sleep")
 
-	winmm               = syscall.NewLazyDLL("winmm.dll")
-	procWaveInOpen       = winmm.NewProc("waveInOpen")
-	procWaveInClose      = winmm.NewProc("waveInClose")
-	procWaveInStart      = winmm.NewProc("waveInStart")
-	procWaveInStop       = winmm.NewProc("waveInStop")
-	procWaveInReset      = winmm.NewProc("waveInReset")
+	winmm                     = syscall.NewLazyDLL("winmm.dll")
+	procWaveInOpen            = winmm.NewProc("waveInOpen")
+	procWaveInClose           = winmm.NewProc("waveInClose")
+	procWaveInStart           = winmm.NewProc("waveInStart")
+	procWaveInStop            = winmm.NewProc("waveInStop")
+	procWaveInReset           = winmm.NewProc("waveInReset")
 	procWaveInPrepareHeader   = winmm.NewProc("waveInPrepareHeader")
 	procWaveInUnprepareHeader = winmm.NewProc("waveInUnprepareHeader")
 	procWaveInAddBuffer       = winmm.NewProc("waveInAddBuffer")
 )
 
-// Windows constants
 const (
-	wmHotkey       = 0x0312
-	waveMapperID   = 0xFFFFFFFF
-	callbackNull   = 0
-	whdrDone       = 0x00000001
+	whKeyboardLL = 13
+	wmKeyDown    = 0x0100
+	wmKeyUp      = 0x0101
+	wmSysKeyDown = 0x0104
+	wmSysKeyUp   = 0x0105
+	wmQuit       = 0x0012
+	waveMapperID = 0xFFFFFFFF
+	callbackNull = 0
+	whdrDone     = 0x00000001
 )
 
-// MOD key modifiers for RegisterHotKey
 const (
-	modAlt     = 0x0001
-	modControl = 0x0002
-	modShift   = 0x0004
+	vkRMenu    = 0xA5
+	vkRControl = 0xA3
+	vkF9       = 0x78
+	vkF13      = 0x7C
 )
 
-// Virtual key codes
-const (
-	vkRMenu   = 0xA5 // Right Alt
-	vkRControl = 0xA3 // Right Control
-	vkF13     = 0x7C
+type kbdLLHookStruct struct {
+	VkCode      uint32
+	ScanCode    uint32
+	Flags       uint32
+	Time        uint32
+	DwExtraInfo uintptr
+}
+
+type msg struct {
+	Hwnd    uintptr
+	Message uint32
+	WParam  uintptr
+	LParam  uintptr
+	Time    uint32
+	Pt      struct{ X, Y int32 }
+}
+
+// --- Global hook state ---
+var (
+	hookTargetVK uint32
+	hookKeyDown  func()
+	hookKeyUp    func()
+	hookHandle   uintptr
+	hookThreadID uint32 // saved for WM_QUIT from signal handler
 )
+
+func hookCallback(nCode int, wParam uintptr, lParam uintptr) uintptr {
+	if nCode >= 0 {
+		kb := (*kbdLLHookStruct)(unsafe.Pointer(lParam))
+		if kb.VkCode == hookTargetVK {
+			switch wParam {
+			case wmKeyDown, wmSysKeyDown:
+				if hookKeyDown != nil {
+					hookKeyDown()
+				}
+			case wmKeyUp, wmSysKeyUp:
+				if hookKeyUp != nil {
+					hookKeyUp()
+				}
+			}
+		}
+	}
+	ret, _, _ := procCallNextHookEx.Call(hookHandle, uintptr(nCode), wParam, lParam)
+	return ret
+}
+
+// --- Audio Recorder ---
 
 type waveFormatEx struct {
 	FormatTag      uint16
@@ -74,21 +126,15 @@ type waveHdr struct {
 	Reserved      uintptr
 }
 
-type msg struct {
-	Hwnd    uintptr
-	Message uint32
-	WParam  uintptr
-	LParam  uintptr
-	Time    uint32
-	Pt      struct{ X, Y int32 }
-}
-
-// audioRecorder records audio using Windows waveIn API.
+// audioRecorder uses a circular buffer pool — 4 buffers rotate,
+// filled buffers are drained and re-queued. No time limit.
 type audioRecorder struct {
 	mu         sync.Mutex
 	handle     uintptr
-	buffers    []*recordBuffer
-	recording  bool
+	buffers    [numBufs]recordBuffer
+	pcm        []byte // accumulated PCM data (grows dynamically)
+	recording  atomic.Bool
+	stopDrain  chan struct{}
 	sampleRate int
 }
 
@@ -98,8 +144,8 @@ type recordBuffer struct {
 }
 
 const (
-	bufferSize  = 32000 // ~1 second at 16kHz 16bit mono
-	bufferCount = 30    // up to 30 seconds
+	bufChunkSize = 16000 // 0.5s at 16kHz 16bit mono
+	numBufs      = 4     // rotating pool
 )
 
 func newAudioRecorder(sampleRate int) *audioRecorder {
@@ -110,186 +156,217 @@ func (r *audioRecorder) start() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	r.pcm = nil
+	r.stopDrain = make(chan struct{})
+
 	wfx := waveFormatEx{
-		FormatTag:      1, // WAVE_FORMAT_PCM
+		FormatTag:      1,
 		Channels:       1,
 		SamplesPerSec:  uint32(r.sampleRate),
-		AvgBytesPerSec: uint32(r.sampleRate * 2), // 16-bit mono
+		AvgBytesPerSec: uint32(r.sampleRate * 2),
 		BlockAlign:     2,
 		BitsPerSample:  16,
 		Size:           0,
 	}
 
-	ret, _, _ := procWaveInOpen.Call(
+	ret, _, err := procWaveInOpen.Call(
 		uintptr(unsafe.Pointer(&r.handle)),
 		uintptr(waveMapperID),
 		uintptr(unsafe.Pointer(&wfx)),
-		0, 0,
-		uintptr(callbackNull),
+		0, 0, uintptr(callbackNull),
 	)
 	if ret != 0 {
-		return fmt.Errorf("waveInOpen failed: %d", ret)
+		return fmt.Errorf("waveInOpen failed: %d (%v)", ret, err)
 	}
 
-	// Prepare buffers
-	r.buffers = make([]*recordBuffer, bufferCount)
 	for i := range r.buffers {
-		buf := &recordBuffer{
-			data: make([]byte, bufferSize),
-		}
-		buf.header.Data = uintptr(unsafe.Pointer(&buf.data[0]))
-		buf.header.BufferLength = uint32(bufferSize)
-
-		procWaveInPrepareHeader.Call(r.handle, uintptr(unsafe.Pointer(&buf.header)), unsafe.Sizeof(buf.header))
-		procWaveInAddBuffer.Call(r.handle, uintptr(unsafe.Pointer(&buf.header)), unsafe.Sizeof(buf.header))
-
-		r.buffers[i] = buf
+		r.buffers[i].data = make([]byte, bufChunkSize)
+		r.buffers[i].header = waveHdr{}
+		r.buffers[i].header.Data = uintptr(unsafe.Pointer(&r.buffers[i].data[0]))
+		r.buffers[i].header.BufferLength = uint32(bufChunkSize)
+		procWaveInPrepareHeader.Call(r.handle, uintptr(unsafe.Pointer(&r.buffers[i].header)), unsafe.Sizeof(r.buffers[i].header))
+		procWaveInAddBuffer.Call(r.handle, uintptr(unsafe.Pointer(&r.buffers[i].header)), unsafe.Sizeof(r.buffers[i].header))
 	}
 
-	ret, _, _ = procWaveInStart.Call(r.handle)
+	ret, _, err = procWaveInStart.Call(r.handle)
 	if ret != 0 {
 		procWaveInClose.Call(r.handle)
-		return fmt.Errorf("waveInStart failed: %d", ret)
+		return fmt.Errorf("waveInStart failed: %d (%v)", ret, err)
 	}
+	r.recording.Store(true)
 
-	r.recording = true
+	// Background goroutine: drain filled buffers and re-queue them.
+	go r.drainLoop()
+
 	return nil
 }
 
+// drainLoop polls for completed buffers, copies data out, re-queues them.
+func (r *audioRecorder) drainLoop() {
+	for {
+		select {
+		case <-r.stopDrain:
+			return
+		default:
+		}
+
+		r.mu.Lock()
+		for i := range r.buffers {
+			hdr := &r.buffers[i].header
+			if hdr.Flags&whdrDone != 0 && hdr.BytesRecorded > 0 {
+				// Copy recorded data
+				r.pcm = append(r.pcm, r.buffers[i].data[:hdr.BytesRecorded]...)
+				// Reset and re-queue
+				procWaveInUnprepareHeader.Call(r.handle, uintptr(unsafe.Pointer(hdr)), unsafe.Sizeof(*hdr))
+				hdr.BytesRecorded = 0
+				hdr.Flags = 0
+				procWaveInPrepareHeader.Call(r.handle, uintptr(unsafe.Pointer(hdr)), unsafe.Sizeof(*hdr))
+				procWaveInAddBuffer.Call(r.handle, uintptr(unsafe.Pointer(hdr)), unsafe.Sizeof(*hdr))
+			}
+		}
+		r.mu.Unlock()
+
+		procSleep.Call(50) // poll every 50ms
+	}
+}
+
 func (r *audioRecorder) stop() []byte {
+	if !r.recording.Load() {
+		return nil
+	}
+	r.recording.Store(false)
+
+	// Stop drain goroutine
+	close(r.stopDrain)
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if !r.recording {
-		return nil
-	}
-	r.recording = false
-
 	procWaveInStop.Call(r.handle)
 	procWaveInReset.Call(r.handle)
+	procSleep.Call(100)
 
-	// Collect recorded data from all buffers that have data
-	var pcm []byte
-	for _, buf := range r.buffers {
-		if buf.header.Flags&whdrDone != 0 && buf.header.BytesRecorded > 0 {
-			pcm = append(pcm, buf.data[:buf.header.BytesRecorded]...)
+	// Drain any remaining buffers
+	for i := range r.buffers {
+		hdr := &r.buffers[i].header
+		if hdr.BytesRecorded > 0 {
+			r.pcm = append(r.pcm, r.buffers[i].data[:hdr.BytesRecorded]...)
 		}
-		procWaveInUnprepareHeader.Call(r.handle, uintptr(unsafe.Pointer(&buf.header)), unsafe.Sizeof(buf.header))
+		procWaveInUnprepareHeader.Call(r.handle, uintptr(unsafe.Pointer(hdr)), unsafe.Sizeof(*hdr))
 	}
 
 	procWaveInClose.Call(r.handle)
-	r.buffers = nil
 
-	return pcm
+	result := r.pcm
+	r.pcm = nil
+	return result
 }
 
-// voiceLoop is the platform-specific hotkey + recording event loop.
+// --- Voice Loop ---
+
 func voiceLoop(ctx context.Context, hotkey string, sampleRate int, onRecorded func(pcm []byte)) error {
-	// Parse hotkey to virtual key code + modifiers
-	vk, mod, err := parseHotkey(hotkey)
+	// Pin goroutine to OS thread — required for Windows hooks.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	vk, err := parseHotkey(hotkey)
 	if err != nil {
 		return err
 	}
 
-	// Register global hotkey
-	const hotkeyID = 1
-	ret, _, _ := procRegisterHotKey.Call(0, hotkeyID, uintptr(mod), uintptr(vk))
-	if ret == 0 {
-		return fmt.Errorf("RegisterHotKey failed (is %s already in use?)", hotkey)
-	}
-	defer procUnregisterHotKey.Call(0, hotkeyID)
+	// Save this thread's ID BEFORE installing hook.
+	tid, _, _ := procGetCurrentThreadId.Call()
+	hookThreadID = uint32(tid)
 
 	recorder := newAudioRecorder(sampleRate)
 	recording := false
 
-	// Message loop in a goroutine, cancel via context
+	hookTargetVK = uint32(vk)
+	hookKeyDown = func() {
+		if !recording {
+			if err := recorder.start(); err != nil {
+				printf("  Recording error: %v\n", err)
+				return
+			}
+			recording = true
+			printf("  ● Recording... (release %s to send)\n", hotkey)
+		}
+	}
+	hookKeyUp = func() {
+		if recording {
+			pcm := recorder.stop()
+			recording = false
+			if len(pcm) > 0 {
+				printf("  ■ Stopped (%d bytes, %.1fs)\n", len(pcm), float64(len(pcm))/float64(sampleRate*2))
+				go onRecorded(pcm)
+			} else {
+				printf("  ■ Stopped (empty)\n")
+			}
+		}
+	}
+
+	// Install low-level keyboard hook on THIS thread.
+	modHandle, _, _ := procGetModuleHandle.Call(0)
+	hk, _, hookErr := procSetWindowsHookEx.Call(
+		whKeyboardLL,
+		syscall.NewCallback(hookCallback),
+		modHandle,
+		0,
+	)
+	if hk == 0 {
+		return fmt.Errorf("SetWindowsHookEx failed: %v", hookErr)
+	}
+	hookHandle = hk
+	defer procUnhookWindowsHookEx.Call(hookHandle)
+
+	printf("  Hook installed (vk=0x%X, thread=%d)\n\n", vk, hookThreadID)
+
+	// Ctrl+C handler: post WM_QUIT to THIS thread's message queue.
 	go func() {
 		<-ctx.Done()
-		// Post WM_QUIT to break GetMessage loop
-		procPostQuitMessage := user32.NewProc("PostThreadMessageW")
-		tid := syscall.NewLazyDLL("kernel32.dll").NewProc("GetCurrentThreadId")
-		// This is best-effort; the process will exit anyway
-		_ = procPostQuitMessage
-		_ = tid
+		procPostThreadMessage.Call(uintptr(hookThreadID), wmQuit, 0, 0)
 	}()
 
+	// Message pump — MUST run on the same thread as the hook.
 	var m msg
 	for {
-		// Check context before blocking on GetMessage
-		select {
-		case <-ctx.Done():
-			if recording {
-				pcm := recorder.stop()
-				if len(pcm) > 0 {
-					onRecorded(pcm)
-				}
-			}
-			return nil
-		default:
-		}
-
-		// PeekMessage with PM_REMOVE to avoid blocking forever
-		procPeekMessage := user32.NewProc("PeekMessageW")
-		ret, _, _ := procPeekMessage.Call(
-			uintptr(unsafe.Pointer(&m)),
-			0, 0, 0,
-			1, // PM_REMOVE
-		)
-		if ret == 0 {
-			// No message, sleep briefly and check context
-			select {
-			case <-ctx.Done():
-				if recording {
-					pcm := recorder.stop()
-					if len(pcm) > 0 {
-						onRecorded(pcm)
-					}
-				}
-				return nil
-			default:
-				time.Sleep(50 * time.Millisecond) // 50ms polling
-				continue
-			}
-		}
-
-		if m.Message == wmHotkey && m.WParam == hotkeyID {
-			if !recording {
-				// Start recording
-				if err := recorder.start(); err != nil {
-					printf("Recording error: %v\n", err)
-					continue
-				}
-				recording = true
-				printf("● Recording...\n")
-			} else {
-				// Stop recording and send
-				pcm := recorder.stop()
-				recording = false
-				if len(pcm) > 0 {
-					printf("■ Stopped (%d bytes)\n", len(pcm))
-					onRecorded(pcm)
-				} else {
-					printf("■ Stopped (empty, skipped)\n")
-				}
-			}
+		ret, _, _ := procGetMessage.Call(uintptr(unsafe.Pointer(&m)), 0, 0, 0)
+		if ret == 0 || ret == uintptr(^uintptr(0)) {
+			// WM_QUIT or error
+			break
 		}
 	}
+
+	// Cleanup: stop recording if still active
+	if recording {
+		pcm := recorder.stop()
+		if len(pcm) > 0 {
+			printf("  Sending final recording...\n")
+			onRecorded(pcm)
+		}
+	}
+
+	printf("  Voice relay stopped.\n")
+	return nil
 }
 
-func parseHotkey(s string) (vk, mod int, err error) {
+func parseHotkey(s string) (int, error) {
 	switch strings.ToLower(s) {
 	case "ralt":
-		return vkRMenu, modAlt, nil
+		return vkRMenu, nil
 	case "rctrl":
-		return vkRControl, modControl, nil
+		return vkRControl, nil
+	case "f9":
+		return vkF9, nil
 	case "f13":
-		return vkF13, 0, nil
+		return vkF13, nil
 	default:
-		return 0, 0, fmt.Errorf("unsupported hotkey %q (use RAlt, RCtrl, or F13)", s)
+		return 0, fmt.Errorf("unsupported hotkey %q (use RAlt, RCtrl, F9, F13)", s)
 	}
 }
 
-// voiceAutoStart creates/removes a Windows startup registry entry.
+// --- Auto-start (registry) ---
+
 func voiceAutoStart(enable bool) error {
 	key, _, err := regCreateKey(regCurrentUser, `Software\Microsoft\Windows\CurrentVersion\Run`)
 	if err != nil {
@@ -316,18 +393,19 @@ func voiceAutoStartEnabled() bool {
 	return err == nil
 }
 
-// Minimal registry helpers (avoid importing golang.org/x/sys/windows/registry)
+// --- Registry helpers ---
+
 var (
-	advapi32         = syscall.NewLazyDLL("advapi32.dll")
-	procRegCreateKey = advapi32.NewProc("RegCreateKeyExW")
-	procRegOpenKey   = advapi32.NewProc("RegOpenKeyExW")
-	procRegSetValue  = advapi32.NewProc("RegSetValueExW")
-	procRegDelValue  = advapi32.NewProc("RegDeleteValueW")
+	advapi32          = syscall.NewLazyDLL("advapi32.dll")
+	procRegCreateKey  = advapi32.NewProc("RegCreateKeyExW")
+	procRegOpenKey    = advapi32.NewProc("RegOpenKeyExW")
+	procRegSetValue   = advapi32.NewProc("RegSetValueExW")
+	procRegDelValue   = advapi32.NewProc("RegDeleteValueW")
 	procRegQueryValue = advapi32.NewProc("RegQueryValueExW")
-	procRegCloseKey  = advapi32.NewProc("RegCloseKey")
+	procRegCloseKey   = advapi32.NewProc("RegCloseKey")
 )
 
-const regCurrentUser = 0x80000001 // HKEY_CURRENT_USER
+const regCurrentUser = 0x80000001
 
 func regCreateKey(root uintptr, path string) (uintptr, bool, error) {
 	pathW, _ := syscall.UTF16PtrFromString(path)
@@ -355,8 +433,7 @@ func regSetString(key uintptr, name, value string) error {
 	nameW, _ := syscall.UTF16PtrFromString(name)
 	valueW, _ := syscall.UTF16FromString(value)
 	ret, _, _ := procRegSetValue.Call(key, uintptr(unsafe.Pointer(nameW)),
-		0, 1, // REG_SZ
-		uintptr(unsafe.Pointer(&valueW[0])), uintptr(len(valueW)*2))
+		0, 1, uintptr(unsafe.Pointer(&valueW[0])), uintptr(len(valueW)*2))
 	if ret != 0 {
 		return fmt.Errorf("RegSetValueEx: %d", ret)
 	}
