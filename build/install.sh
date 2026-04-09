@@ -101,6 +101,10 @@ install -m 755 "$TMPDIR/tailscaled" /usr/local/bin/tailscaled
 install -m 755 "$TMPDIR/tailscale"  /usr/local/bin/tailscale
 rm -rf "$TMPDIR"
 
+# ad-hoc sign (macOS Sequoia+ kills unsigned binaries in system paths)
+codesign --force --sign - /usr/local/bin/tailscaled 2>/dev/null || true
+codesign --force --sign - /usr/local/bin/tailscale  2>/dev/null || true
+
 mkdir -p /var/run/tailscale
 mkdir -p /Library/Tailscale
 
