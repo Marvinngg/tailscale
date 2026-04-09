@@ -6,6 +6,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"syscall"
@@ -286,4 +287,109 @@ func parseHotkey(s string) (vk, mod int, err error) {
 	default:
 		return 0, 0, fmt.Errorf("unsupported hotkey %q (use RAlt, RCtrl, or F13)", s)
 	}
+}
+
+// voiceAutoStart creates/removes a Windows startup registry entry.
+func voiceAutoStart(enable bool) error {
+	key, _, err := regCreateKey(regCurrentUser, `Software\Microsoft\Windows\CurrentVersion\Run`)
+	if err != nil {
+		return fmt.Errorf("open registry: %w", err)
+	}
+	defer regCloseKey(key)
+
+	const valueName = "TailscaleVoice"
+	if enable {
+		exe, _ := os.Executable()
+		cmd := fmt.Sprintf(`"%s" voice`, exe)
+		return regSetString(key, valueName, cmd)
+	}
+	return regDeleteValue(key, valueName)
+}
+
+func voiceAutoStartEnabled() bool {
+	key, err := regOpenKey(regCurrentUser, `Software\Microsoft\Windows\CurrentVersion\Run`)
+	if err != nil {
+		return false
+	}
+	defer regCloseKey(key)
+	_, err = regGetString(key, "TailscaleVoice")
+	return err == nil
+}
+
+// Minimal registry helpers (avoid importing golang.org/x/sys/windows/registry)
+var (
+	advapi32         = syscall.NewLazyDLL("advapi32.dll")
+	procRegCreateKey = advapi32.NewProc("RegCreateKeyExW")
+	procRegOpenKey   = advapi32.NewProc("RegOpenKeyExW")
+	procRegSetValue  = advapi32.NewProc("RegSetValueExW")
+	procRegDelValue  = advapi32.NewProc("RegDeleteValueW")
+	procRegQueryValue = advapi32.NewProc("RegQueryValueExW")
+	procRegCloseKey  = advapi32.NewProc("RegCloseKey")
+)
+
+const regCurrentUser = 0x80000001 // HKEY_CURRENT_USER
+
+func regCreateKey(root uintptr, path string) (uintptr, bool, error) {
+	pathW, _ := syscall.UTF16PtrFromString(path)
+	var key uintptr
+	var disp uint32
+	ret, _, _ := procRegCreateKey.Call(root, uintptr(unsafe.Pointer(pathW)),
+		0, 0, 0, 0xF003F, 0, uintptr(unsafe.Pointer(&key)), uintptr(unsafe.Pointer(&disp)))
+	if ret != 0 {
+		return 0, false, fmt.Errorf("RegCreateKeyEx: %d", ret)
+	}
+	return key, disp == 1, nil
+}
+
+func regOpenKey(root uintptr, path string) (uintptr, error) {
+	pathW, _ := syscall.UTF16PtrFromString(path)
+	var key uintptr
+	ret, _, _ := procRegOpenKey.Call(root, uintptr(unsafe.Pointer(pathW)), 0, 0x20019, uintptr(unsafe.Pointer(&key)))
+	if ret != 0 {
+		return 0, fmt.Errorf("RegOpenKeyEx: %d", ret)
+	}
+	return key, nil
+}
+
+func regSetString(key uintptr, name, value string) error {
+	nameW, _ := syscall.UTF16PtrFromString(name)
+	valueW, _ := syscall.UTF16FromString(value)
+	ret, _, _ := procRegSetValue.Call(key, uintptr(unsafe.Pointer(nameW)),
+		0, 1, // REG_SZ
+		uintptr(unsafe.Pointer(&valueW[0])), uintptr(len(valueW)*2))
+	if ret != 0 {
+		return fmt.Errorf("RegSetValueEx: %d", ret)
+	}
+	return nil
+}
+
+func regDeleteValue(key uintptr, name string) error {
+	nameW, _ := syscall.UTF16PtrFromString(name)
+	ret, _, _ := procRegDelValue.Call(key, uintptr(unsafe.Pointer(nameW)))
+	if ret != 0 {
+		return fmt.Errorf("RegDeleteValue: %d", ret)
+	}
+	return nil
+}
+
+func regGetString(key uintptr, name string) (string, error) {
+	nameW, _ := syscall.UTF16PtrFromString(name)
+	var dataType, size uint32
+	ret, _, _ := procRegQueryValue.Call(key, uintptr(unsafe.Pointer(nameW)),
+		0, uintptr(unsafe.Pointer(&dataType)), 0, uintptr(unsafe.Pointer(&size)))
+	if ret != 0 {
+		return "", fmt.Errorf("RegQueryValueEx: %d", ret)
+	}
+	buf := make([]uint16, size/2)
+	ret, _, _ = procRegQueryValue.Call(key, uintptr(unsafe.Pointer(nameW)),
+		0, uintptr(unsafe.Pointer(&dataType)),
+		uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&size)))
+	if ret != 0 {
+		return "", fmt.Errorf("RegQueryValueEx: %d", ret)
+	}
+	return syscall.UTF16ToString(buf), nil
+}
+
+func regCloseKey(key uintptr) {
+	procRegCloseKey.Call(key)
 }

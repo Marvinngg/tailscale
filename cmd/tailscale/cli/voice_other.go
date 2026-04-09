@@ -13,3 +13,11 @@ import (
 func voiceLoop(ctx context.Context, hotkey string, sampleRate int, onRecorded func(pcm []byte)) error {
 	return fmt.Errorf("tailscale voice is only supported on Windows")
 }
+
+func voiceAutoStart(enable bool) error {
+	return fmt.Errorf("voice auto-start is only supported on Windows")
+}
+
+func voiceAutoStartEnabled() bool {
+	return false
+}

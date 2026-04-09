@@ -7,12 +7,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -24,27 +27,92 @@ func init() {
 	voiceCmd = getVoiceCmd
 }
 
+// voiceConfig is persisted to disk for auto-start.
+type voiceConfig struct {
+	Target     string `json:"target"`
+	Hotkey     string `json:"hotkey"`
+	Token      string `json:"token"`
+	SampleRate int    `json:"sample_rate"`
+}
+
+func voiceConfigPath() string {
+	if runtime.GOOS == "windows" {
+		return filepath.Join(os.Getenv("APPDATA"), "Tailscale", "voice.json")
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".config", "tailscale", "voice.json")
+}
+
+func loadVoiceConfig() (*voiceConfig, error) {
+	data, err := os.ReadFile(voiceConfigPath())
+	if err != nil {
+		return nil, err
+	}
+	var cfg voiceConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, err
+	}
+	return &cfg, nil
+}
+
+func saveVoiceConfig(cfg *voiceConfig) error {
+	path := voiceConfigPath()
+	os.MkdirAll(filepath.Dir(path), 0755)
+	data, _ := json.MarshalIndent(cfg, "", "  ")
+	return os.WriteFile(path, data, 0644)
+}
+
 func getVoiceCmd() *ffcli.Command {
 	return &ffcli.Command{
 		Name:       "voice",
-		ShortUsage: "tailscale voice --target <host:port> [--hotkey RAlt]",
+		ShortUsage: "tailscale voice [--target <host:port>] | setup | stop | status",
 		ShortHelp:  "Voice relay: record audio and send to a remote WE instance",
 		LongHelp: strings.TrimSpace(`
-Record audio from the local microphone and send it to a remote WE
-instance for speech recognition. The target should be a Tailscale
-node running WE with remote inbox enabled.
+Voice relay service. Records audio from the local microphone when a
+hotkey is pressed, sends it to a remote WE instance for speech recognition.
 
-Press the hotkey to start recording, release to stop and send.
-Press Ctrl+C to exit.
+First time: tailscale voice setup --target mac-dev:9800
+  Saves config and creates auto-start entry. Runs in background from then on.
+
+Manual run: tailscale voice --target mac-dev:9800
+  Runs in foreground (Ctrl+C to exit).
+
+Other: tailscale voice status  — show current config
+       tailscale voice stop    — remove auto-start
 `),
 		FlagSet: (func() *flag.FlagSet {
 			fs := newFlagSet("voice")
-			fs.StringVar(&voiceArgs.target, "target", "", "target host:port (e.g. mac-dev:9800 or 100.64.0.5:9800)")
-			fs.StringVar(&voiceArgs.hotkey, "hotkey", "RAlt", "hotkey to hold for recording (RAlt, RCtrl, F13)")
-			fs.StringVar(&voiceArgs.token, "token", "", "auth token for WE remote inbox")
-			fs.IntVar(&voiceArgs.sampleRate, "rate", 16000, "audio sample rate in Hz")
+			fs.StringVar(&voiceArgs.target, "target", "", "target host:port (e.g. mac-dev:9800)")
+			fs.StringVar(&voiceArgs.hotkey, "hotkey", "RAlt", "hotkey (RAlt, RCtrl, F13)")
+			fs.StringVar(&voiceArgs.token, "token", "", "auth token")
+			fs.IntVar(&voiceArgs.sampleRate, "rate", 16000, "sample rate Hz")
 			return fs
 		})(),
+		Subcommands: []*ffcli.Command{
+			{
+				Name:      "setup",
+				ShortHelp: "Save config and enable auto-start",
+				FlagSet: (func() *flag.FlagSet {
+					fs := newFlagSet("voice setup")
+					fs.StringVar(&voiceArgs.target, "target", "", "target host:port")
+					fs.StringVar(&voiceArgs.hotkey, "hotkey", "RAlt", "hotkey")
+					fs.StringVar(&voiceArgs.token, "token", "", "auth token")
+					fs.IntVar(&voiceArgs.sampleRate, "rate", 16000, "sample rate Hz")
+					return fs
+				})(),
+				Exec: runVoiceSetup,
+			},
+			{
+				Name:      "stop",
+				ShortHelp: "Remove auto-start",
+				Exec:      runVoiceStop,
+			},
+			{
+				Name:      "status",
+				ShortHelp: "Show voice relay config",
+				Exec:      runVoiceStatus,
+			},
+		},
 		Exec: runVoice,
 	}
 }
@@ -57,19 +125,34 @@ var voiceArgs struct {
 }
 
 func runVoice(ctx context.Context, args []string) error {
-	if voiceArgs.target == "" {
-		return fmt.Errorf("--target is required (e.g. --target mac-dev:9800)")
+	target := voiceArgs.target
+
+	// If no target specified, try loading saved config
+	if target == "" {
+		if cfg, err := loadVoiceConfig(); err == nil && cfg.Target != "" {
+			target = cfg.Target
+			if voiceArgs.hotkey == "RAlt" && cfg.Hotkey != "" {
+				voiceArgs.hotkey = cfg.Hotkey
+			}
+			if voiceArgs.sampleRate == 16000 && cfg.SampleRate != 0 {
+				voiceArgs.sampleRate = cfg.SampleRate
+			}
+			if voiceArgs.token == "" && cfg.Token != "" {
+				voiceArgs.token = cfg.Token
+			}
+		}
 	}
 
-	// Resolve target: if no port specified, default to 9800
-	target := voiceArgs.target
+	if target == "" {
+		return fmt.Errorf("no target configured. Run: tailscale voice setup --target <host:port>")
+	}
+
+	// Resolve target
 	if !strings.Contains(target, ":") {
 		target += ":9800"
 	}
-
-	// If target looks like a Tailscale hostname (no dots), resolve via status
 	host, _, _ := strings.Cut(target, ":")
-	if !strings.Contains(host, ".") {
+	if !strings.Contains(host, ".") && host != "localhost" {
 		ip, err := resolveNode(ctx, host)
 		if err != nil {
 			return fmt.Errorf("cannot resolve %q: %w", host, err)
@@ -83,11 +166,10 @@ func runVoice(ctx context.Context, args []string) error {
 
 	printf("Voice relay ready\n")
 	printf("  Target:  %s\n", targetURL)
-	printf("  Hotkey:  %s (hold to record, release to send)\n", voiceArgs.hotkey)
+	printf("  Hotkey:  %s (press to toggle recording)\n", voiceArgs.hotkey)
 	printf("  Rate:    %d Hz\n", voiceArgs.sampleRate)
 	printf("  Ctrl+C to exit\n\n")
 
-	// Platform-specific hotkey + recording loop
 	ctx, cancel := signal.NotifyContext(ctx, os.Interrupt)
 	defer cancel()
 
@@ -102,13 +184,67 @@ func runVoice(ctx context.Context, args []string) error {
 	})
 }
 
+func runVoiceSetup(ctx context.Context, args []string) error {
+	if voiceArgs.target == "" {
+		return fmt.Errorf("--target is required")
+	}
+
+	cfg := &voiceConfig{
+		Target:     voiceArgs.target,
+		Hotkey:     voiceArgs.hotkey,
+		Token:      voiceArgs.token,
+		SampleRate: voiceArgs.sampleRate,
+	}
+
+	if err := saveVoiceConfig(cfg); err != nil {
+		return fmt.Errorf("save config: %w", err)
+	}
+	printf("Config saved: %s\n", voiceConfigPath())
+
+	// Create auto-start entry
+	if err := voiceAutoStart(true); err != nil {
+		printf("Warning: auto-start setup failed: %v\n", err)
+		printf("You can still run manually: tailscale voice\n")
+	} else {
+		printf("Auto-start enabled\n")
+	}
+
+	printf("\nSetup complete. Voice relay will start automatically on login.\n")
+	printf("To start now: tailscale voice\n")
+	printf("To remove: tailscale voice stop\n")
+	return nil
+}
+
+func runVoiceStop(ctx context.Context, args []string) error {
+	if err := voiceAutoStart(false); err != nil {
+		return err
+	}
+	printf("Auto-start removed\n")
+	return nil
+}
+
+func runVoiceStatus(ctx context.Context, args []string) error {
+	cfg, err := loadVoiceConfig()
+	if err != nil {
+		printf("Not configured. Run: tailscale voice setup --target <host:port>\n")
+		return nil
+	}
+	printf("Config: %s\n", voiceConfigPath())
+	printf("  Target:  %s\n", cfg.Target)
+	printf("  Hotkey:  %s\n", cfg.Hotkey)
+	printf("  Rate:    %d Hz\n", cfg.SampleRate)
+
+	autoStart := voiceAutoStartEnabled()
+	printf("  Auto-start: %v\n", autoStart)
+	return nil
+}
+
 // resolveNode resolves a Tailscale node name to its Tailscale IP.
 func resolveNode(ctx context.Context, name string) (string, error) {
 	st, err := localClient.Status(ctx)
 	if err != nil {
 		return "", err
 	}
-
 	name = strings.ToLower(name)
 	for _, peer := range st.Peer {
 		if matchesPeer(peer, name) && len(peer.TailscaleIPs) > 0 {
@@ -122,14 +258,12 @@ func matchesPeer(peer *ipnstate.PeerStatus, name string) bool {
 	if strings.ToLower(peer.HostName) == name {
 		return true
 	}
-	// Match DNS name prefix (e.g. "mac-dev" matches "mac-dev.ts.example.com")
 	if strings.HasPrefix(strings.ToLower(peer.DNSName), name+".") {
 		return true
 	}
 	return false
 }
 
-// sendWAV sends a WAV file to the WE remote inbox.
 func sendWAV(url, token string, wav []byte) error {
 	req, err := http.NewRequest("POST", url, bytes.NewReader(wav))
 	if err != nil {
@@ -139,7 +273,6 @@ func sendWAV(url, token string, wav []byte) error {
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
-
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -147,14 +280,12 @@ func sendWAV(url, token string, wav []byte) error {
 	}
 	defer resp.Body.Close()
 	io.Copy(io.Discard, resp.Body)
-
 	if resp.StatusCode != 200 {
 		return fmt.Errorf("server returned %s", resp.Status)
 	}
 	return nil
 }
 
-// pcmToWAV wraps raw PCM data in a WAV header.
 func pcmToWAV(pcm []byte, sampleRate, channels, bitsPerSample int) []byte {
 	dataSize := len(pcm)
 	blockAlign := channels * bitsPerSample / 8
@@ -163,12 +294,9 @@ func pcmToWAV(pcm []byte, sampleRate, channels, bitsPerSample int) []byte {
 	var buf bytes.Buffer
 	buf.Grow(44 + dataSize)
 
-	// RIFF header
 	buf.WriteString("RIFF")
 	binary.Write(&buf, binary.LittleEndian, uint32(36+dataSize))
 	buf.WriteString("WAVE")
-
-	// fmt chunk
 	buf.WriteString("fmt ")
 	binary.Write(&buf, binary.LittleEndian, uint32(16))
 	binary.Write(&buf, binary.LittleEndian, uint16(1)) // PCM
@@ -177,8 +305,6 @@ func pcmToWAV(pcm []byte, sampleRate, channels, bitsPerSample int) []byte {
 	binary.Write(&buf, binary.LittleEndian, uint32(byteRate))
 	binary.Write(&buf, binary.LittleEndian, uint16(blockAlign))
 	binary.Write(&buf, binary.LittleEndian, uint16(bitsPerSample))
-
-	// data chunk
 	buf.WriteString("data")
 	binary.Write(&buf, binary.LittleEndian, uint32(dataSize))
 	buf.Write(pcm)
