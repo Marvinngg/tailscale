@@ -203,10 +203,16 @@ func (h *Handlers) receiveFile(w http.ResponseWriter, r *http.Request, fileName 
 		sender = r.RemoteAddr
 	}
 	os.MkdirAll(h.cfg.InboxDir, 0755)
-	meta := fmt.Sprintf(`{"file":"%s","size":%d,"from":"%s","time":"%s","path":"%s"}`,
-		fileName, n, sender, time.Now().Format(time.RFC3339), destPath)
+	meta := map[string]interface{}{
+		"file": fileName,
+		"size": n,
+		"from": sender,
+		"time": time.Now().Format(time.RFC3339),
+		"path": destPath,
+	}
+	metaJSON, _ := json.Marshal(meta)
 	metaFile := filepath.Join(h.cfg.InboxDir, fileName+".json")
-	os.WriteFile(metaFile, []byte(meta), 0644)
+	os.WriteFile(metaFile, metaJSON, 0644)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
