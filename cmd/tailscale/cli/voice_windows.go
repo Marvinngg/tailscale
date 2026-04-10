@@ -339,43 +339,6 @@ func voiceLoop(ctx context.Context, hotkey string, sampleRate int, onRecorded fu
 
 	printf("  Hook installed (vk=0x%X, thread=%d)\n\n", vk, hookThreadID)
 
-	// Monitor foreground window changes. When a remote desktop app
-	// gains focus, it installs its own keyboard hook with higher
-	// priority. We re-install ours AFTER to regain priority.
-	// This is the proven technique from the AutoHotkey community.
-	procGetForegroundWindow := user32.NewProc("GetForegroundWindow")
-	procGetClassNameW := user32.NewProc("GetClassNameW")
-
-	var lastFgWindow uintptr
-	isRemoteDesktopClass := func(hwnd uintptr) bool {
-		if hwnd == 0 {
-			return false
-		}
-		buf := make([]uint16, 256)
-		procGetClassNameW.Call(hwnd, uintptr(unsafe.Pointer(&buf[0])), 256)
-		cls := syscall.UTF16ToString(buf)
-		// Known remote desktop window classes:
-		// TscShellContainerClass = mstsc.exe
-		// RAIL_WINDOW = RemoteApp
-		// OPContainerClass = Remote Desktop Manager embedded
-		// QWidget, Qt5152QWindowIcon = various VNC clients
-		// Also match anything with "remote", "vnc", "rdp" in class name
-		switch cls {
-		case "TscShellContainerClass", "RAIL_WINDOW", "OPContainerClass":
-			return true
-		}
-		lowerCls := strings.ToLower(cls)
-		if strings.Contains(lowerCls, "remote") || strings.Contains(lowerCls, "vnc") ||
-			strings.Contains(lowerCls, "rdp") || strings.Contains(lowerCls, "parsec") {
-			return true
-		}
-		return false
-	}
-
-	// Timer: re-install hook when remote desktop gains focus.
-	procSetTimer := user32.NewProc("SetTimer")
-	procSetTimer.Call(0, 1, 500, 0) // 500ms timer → generates WM_TIMER
-
 	// Ctrl+C handler: post WM_QUIT to THIS thread's message queue.
 	go func() {
 		<-ctx.Done()
@@ -383,29 +346,11 @@ func voiceLoop(ctx context.Context, hotkey string, sampleRate int, onRecorded fu
 	}()
 
 	// Message pump — MUST run on the same thread as the hook.
-	const wmTimer = 0x0113
 	var m msg
 	for {
 		ret, _, _ := procGetMessage.Call(uintptr(unsafe.Pointer(&m)), 0, 0, 0)
 		if ret == 0 || ret == uintptr(^uintptr(0)) {
 			break
-		}
-
-		// On WM_TIMER: check if foreground window changed to remote desktop
-		if m.Message == wmTimer {
-			fgWnd, _, _ := procGetForegroundWindow.Call()
-			if fgWnd != lastFgWindow {
-				lastFgWindow = fgWnd
-				if isRemoteDesktopClass(fgWnd) {
-					// Remote desktop just gained focus — wait for it to
-					// install its hook, then re-install ours on top.
-					procSleep.Call(100)
-					installHook()
-					if hookDebug.Load() {
-						printf("  [debug] re-installed hook (remote desktop focused)\n")
-					}
-				}
-			}
 		}
 	}
 
