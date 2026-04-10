@@ -180,6 +180,7 @@ fi
 /usr/local/bin/tailscale up \
   --login-server="$HEADSCALE_URL" \
   --auth-key="$AUTH_KEY" \
+  --accept-dns=false \
   --reset \
   $EXIT_FLAG \
   $LAN_FLAG
