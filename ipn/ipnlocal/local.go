@@ -5539,7 +5539,7 @@ func (b *LocalBackend) routerConfigLocked(cfg *wgcfg.Config, prefs ipn.PrefsView
 
 	// On macOS (no fwmark), collect bypass routes so tunnel routes
 	// don't capture VPN infrastructure traffic.
-	if runtime.GOOS == "darwin" && (prefs.ExitNodeID() != "" || prefs.ExitNodeIP().IsValid()) {
+	if prefs.ExitNodeID() != "" || prefs.ExitNodeIP().IsValid() {
 		rs.BypassRoutes = b.collectBypassRoutesLocked(prefs)
 	}
 

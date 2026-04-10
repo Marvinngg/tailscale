@@ -44,6 +44,7 @@ type winRouter struct {
 	nativeTun           *tun.NativeTun
 	routeChangeCallback *winipcfg.RouteChangeCallback
 	firewall            *firewallTweaker
+	bypassRoutes        map[netip.Prefix]bool
 }
 
 func newUserspaceRouter(logf logger.Logf, tundev tun.Device, netMon *netmon.Monitor, health *health.Tracker, bus *eventbus.Bus) (router.Router, error) {
@@ -91,6 +92,11 @@ func (r *winRouter) Set(cfg *router.Config) error {
 	}
 	r.firewall.set(localAddrs, cfg.Routes, cfg.LocalRoutes)
 
+	// Add bypass routes via the default gateway before configuring the
+	// tunnel interface. These more-specific routes ensure control plane,
+	// DERP, and user-configured subnets remain reachable.
+	r.setBypassRoutes(cfg.BypassRoutes)
+
 	err := configureInterface(cfg, r.nativeTun, r.health)
 	if err != nil {
 		r.logf("ConfigureInterface: %v", err)
@@ -114,7 +120,77 @@ func hasDefaultRoute(routes []netip.Prefix) bool {
 	return false
 }
 
+// setBypassRoutes adds/removes routes via the default gateway so that
+// specific prefixes (control plane, DERP, 114/8, etc.) bypass the tunnel.
+func (r *winRouter) setBypassRoutes(wanted []netip.Prefix) {
+	newBypass := make(map[netip.Prefix]bool, len(wanted))
+	for _, p := range wanted {
+		newBypass[p] = true
+	}
+
+	// Remove stale routes
+	for route := range r.bypassRoutes {
+		if !newBypass[route] {
+			nstr := fmt.Sprintf("%s/%d", route.Masked().Addr(), route.Bits())
+			exec.Command("route", "delete", nstr).Run()
+		}
+	}
+
+	if len(newBypass) == 0 {
+		r.bypassRoutes = nil
+		return
+	}
+
+	// Find default gateway
+	gw := defaultGatewayWindows()
+	if gw == "" {
+		r.logf("bypass routes: no default gateway found")
+		r.bypassRoutes = newBypass
+		return
+	}
+
+	added := 0
+	for route := range newBypass {
+		if r.bypassRoutes[route] {
+			continue
+		}
+		if route.Addr().Is6() {
+			continue // skip IPv6 for now
+		}
+		nstr := fmt.Sprintf("%s/%d", route.Masked().Addr(), route.Bits())
+		mask := netipPrefixToMask(route)
+		if err := exec.Command("route", "add", route.Masked().Addr().String(), "mask", mask, gw).Run(); err != nil {
+			r.logf("bypass route add %s via %s: %v", nstr, gw, err)
+		} else {
+			added++
+		}
+	}
+	if added > 0 {
+		r.logf("bypass routes: added %d via gw=%s", added, gw)
+	}
+	r.bypassRoutes = newBypass
+}
+
+func defaultGatewayWindows() string {
+	out, err := exec.Command("powershell", "-Command",
+		"(Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Sort-Object RouteMetric | Select-Object -First 1).NextHop").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func netipPrefixToMask(p netip.Prefix) string {
+	bits := p.Bits()
+	if p.Addr().Is4() {
+		mask := uint32(0xFFFFFFFF) << (32 - bits)
+		return fmt.Sprintf("%d.%d.%d.%d", mask>>24, (mask>>16)&0xFF, (mask>>8)&0xFF, mask&0xFF)
+	}
+	return ""
+}
+
 func (r *winRouter) Close() error {
+	r.setBypassRoutes(nil)
 	r.firewall.clear()
 
 	if r.routeChangeCallback != nil {
