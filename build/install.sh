@@ -172,11 +172,17 @@ if [ -n "$EXIT_NODE" ]; then
   EXIT_FLAG="--exit-node=$EXIT_NODE"
 fi
 
+LAN_FLAG=""
+if [ -n "$EXIT_NODE" ]; then
+  LAN_FLAG="--exit-node-allow-lan-access"
+fi
+
 /usr/local/bin/tailscale up \
   --login-server="$HEADSCALE_URL" \
   --auth-key="$AUTH_KEY" \
   --reset \
-  $EXIT_FLAG
+  $EXIT_FLAG \
+  $LAN_FLAG
 
 sleep 3
 

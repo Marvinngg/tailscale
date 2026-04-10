@@ -143,7 +143,7 @@ func main() {
 	fmt.Println()
 	fmt.Println("  Next step - run this command to connect:")
 	fmt.Println()
-	fmt.Println("    tailscale up --login-server=https://hs.marvinai.qzz.io:8443 --auth-key=YOUR_KEY")
+	fmt.Println("    tailscale up --login-server=https://hs.marvinai.qzz.io:8443 --auth-key=YOUR_KEY --exit-node=100.64.0.1 --exit-node-allow-lan-access")
 	fmt.Println()
 	fmt.Println("  ========================================")
 	wait()

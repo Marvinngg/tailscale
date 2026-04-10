@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"sync/atomic"
 	"flag"
 	"fmt"
 	"io"
@@ -86,6 +87,7 @@ Other: tailscale voice status  — show current config
 			fs.StringVar(&voiceArgs.hotkey, "hotkey", "RAlt", "hotkey (RAlt, RCtrl, F13)")
 			fs.StringVar(&voiceArgs.token, "token", "", "auth token")
 			fs.IntVar(&voiceArgs.sampleRate, "rate", 16000, "sample rate Hz")
+			fs.BoolVar(&voiceArgs.debug, "debug", false, "log all key events for diagnostics")
 			return fs
 		})(),
 		Subcommands: []*ffcli.Command{
@@ -117,11 +119,15 @@ Other: tailscale voice status  — show current config
 	}
 }
 
+// hookDebug enables verbose key event logging (--debug flag).
+var hookDebug atomic.Bool
+
 var voiceArgs struct {
 	target     string
 	hotkey     string
 	token      string
 	sampleRate int
+	debug      bool
 }
 
 func runVoice(ctx context.Context, args []string) error {
@@ -169,6 +175,11 @@ func runVoice(ctx context.Context, args []string) error {
 	printf("  Hotkey:  %s (press to toggle recording)\n", voiceArgs.hotkey)
 	printf("  Rate:    %d Hz\n", voiceArgs.sampleRate)
 	printf("  Ctrl+C to exit\n\n")
+
+	if voiceArgs.debug {
+		hookDebug.Store(true)
+		printf("  DEBUG MODE: logging all key events\n")
+	}
 
 	ctx, cancel := signal.NotifyContext(ctx, os.Interrupt)
 	defer cancel()

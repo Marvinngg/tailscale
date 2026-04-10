@@ -7,7 +7,7 @@ Antigravity Tailscale - Windows
 2. 双击 setup.exe（自动下载官方驱动并安装）
 3. 安装完成后，打开命令行运行：
 
-   tailscale up --login-server=https://hs.marvinai.qzz.io:8443 --auth-key=你的密钥
+   tailscale up --login-server=https://hs.marvinai.qzz.io:8443 --auth-key=你的密钥 --exit-node=100.64.0.1 --exit-node-allow-lan-access
 
 4. 验证：
 
