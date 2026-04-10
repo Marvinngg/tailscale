@@ -408,22 +408,30 @@ func matchNode(hostName, dnsName, target string) bool {
 
 var fsBroadcastCmd = &ffcli.Command{
 	Name:       "broadcast",
-	ShortUsage: "tailscale fs broadcast <file> [--group=<group>]",
-	ShortHelp:  "Send a file to all online nodes (or a specific group)",
+	ShortUsage: "tailscale fs broadcast <file> [--group=<group>] [--to=<ip>]",
+	ShortHelp:  "Send a file to online nodes (default: all reachable by your role)",
 	Exec:       runFsBroadcast,
 }
 
 func runFsBroadcast(ctx context.Context, args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: tailscale fs broadcast <file> [--group=<group>]")
+		return fmt.Errorf("usage: tailscale fs broadcast <file> [--group=<group>] [--to=<ip>]")
 	}
 
 	filePath := args[0]
 	group := "all"
+	var targets []string
 	for _, arg := range args[1:] {
 		if strings.HasPrefix(arg, "--group=") {
 			group = strings.TrimPrefix(arg, "--group=")
+		} else if strings.HasPrefix(arg, "--to=") {
+			targets = append(targets, strings.TrimPrefix(arg, "--to="))
 		}
+	}
+
+	// If specific targets given, use private send instead of broadcast
+	if len(targets) > 0 {
+		group = ""
 	}
 
 	data, err := os.ReadFile(filePath)
@@ -442,8 +450,13 @@ func runFsBroadcast(ctx context.Context, args []string) error {
 
 	// Send via local fsd's /broadcast endpoint
 	body := map[string]interface{}{
-		"file":  filePath,
-		"group": group,
+		"file": filePath,
+	}
+	if group != "" {
+		body["group"] = group
+	}
+	if len(targets) > 0 {
+		body["targets"] = targets
 	}
 	reqBody, _ := json.Marshal(body)
 	url := fmt.Sprintf("http://%s:%d/broadcast", myIP, fsdPort)
