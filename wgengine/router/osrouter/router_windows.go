@@ -90,7 +90,11 @@ func (r *winRouter) Set(cfg *router.Config) error {
 	for _, la := range cfg.LocalAddrs {
 		localAddrs = append(localAddrs, la.String())
 	}
-	r.firewall.set(localAddrs, cfg.Routes, cfg.LocalRoutes)
+	// Merge BypassRoutes into LocalRoutes so the WFP killswitch
+	// permits them through the physical interface.
+	mergedLocalRoutes := append([]netip.Prefix{}, cfg.LocalRoutes...)
+	mergedLocalRoutes = append(mergedLocalRoutes, cfg.BypassRoutes...)
+	r.firewall.set(localAddrs, cfg.Routes, mergedLocalRoutes)
 
 	// Add bypass routes via the default gateway before configuring the
 	// tunnel interface. These more-specific routes ensure control plane,
