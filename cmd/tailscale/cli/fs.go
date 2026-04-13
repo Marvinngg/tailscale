@@ -446,9 +446,20 @@ func runFsBroadcast(ctx context.Context, args []string) error {
 	if len(st.TailscaleIPs) == 0 {
 		return fmt.Errorf("not connected")
 	}
-	myIP := st.TailscaleIPs[0].String()
 
-	// Send via local fsd's /broadcast endpoint
+	// Broadcast goes to the SERVER's fsd (exit node), not local.
+	// Server does permission check and SSE notification.
+	serverIP := "100.64.0.1" // default exit node
+	// Try to find actual exit node from status
+	for _, p := range st.Peer {
+		if p.ExitNode {
+			if len(p.TailscaleIPs) > 0 {
+				serverIP = p.TailscaleIPs[0].String()
+			}
+			break
+		}
+	}
+
 	body := map[string]interface{}{
 		"file": filePath,
 	}
@@ -459,7 +470,7 @@ func runFsBroadcast(ctx context.Context, args []string) error {
 		body["targets"] = targets
 	}
 	reqBody, _ := json.Marshal(body)
-	url := fmt.Sprintf("http://%s:%d/broadcast", myIP, fsdPort)
+	url := fmt.Sprintf("http://%s:%d/broadcast", serverIP, fsdPort)
 	resp, err := http.Post(url, "application/json", bytes.NewReader(reqBody))
 	if err != nil {
 		return err
