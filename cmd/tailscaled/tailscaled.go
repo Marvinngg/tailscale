@@ -614,7 +614,10 @@ func startIPNServer(ctx context.Context, logf logger.Logf, logID logid.PublicID,
 						cfg.ReceiveDir = bestDir
 					}
 				}
-				logf("fsd: receive dir: %s", cfg.ReceiveDir)
+				// Subscribe to the exit node's fsd for broadcast notifications.
+				// Default server: 100.64.0.1:7700 (the exit node).
+				cfg.ServerAddr = "100.64.0.1:7700"
+				logf("fsd: receive dir: %s, server: %s", cfg.ReceiveDir, cfg.ServerAddr)
 				fs := fsd.New(cfg)
 				if err := fs.Start(ctx); err != nil {
 					logf("fsd: %v", err)

@@ -15,8 +15,9 @@ import (
 
 // Handlers implements the HTTP API.
 type Handlers struct {
-	cfg Config
-	lc  *tailscale.LocalClient
+	cfg    Config
+	lc     *tailscale.LocalClient
+	broker *Broker
 }
 
 func NewHandlers(cfg Config, lc *tailscale.LocalClient) *Handlers {
@@ -295,14 +296,14 @@ func (h *Handlers) HandleSend(w http.ResponseWriter, r *http.Request) {
 }
 
 // HandleBroadcast handles POST /broadcast
-// Sends a file from the shared library to all online nodes or a specific group.
+// Stores file in broadcast directory and pushes SSE notification to connected clients.
 func (h *Handlers) HandleBroadcast(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)
 		return
 	}
 
-	_, _, role := CallerInfo(r)
+	nodeName, _, role := CallerInfo(r)
 	acl := GetACL()
 	if acl != nil && !acl.CanBroadcast(role) {
 		http.Error(w, "permission denied: cannot broadcast", http.StatusForbidden)
@@ -315,17 +316,71 @@ func (h *Handlers) HandleBroadcast(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Default to "all" if no group specified
-	if req.Group == "" && len(req.Targets) == 0 {
-		req.Group = "all"
+	group := req.Group
+	if group == "" && len(req.Targets) == 0 {
+		group = "all"
 	}
 
-	results, err := Send(r.Context(), h.lc, h.cfg, req)
+	// Read the file
+	filePath := req.File
+	if !filepath.IsAbs(filePath) {
+		filePath = filepath.Join(h.cfg.SharedDir, filePath)
+	}
+	data, err := os.ReadFile(filePath)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, fmt.Sprintf("read file: %v", err), http.StatusBadRequest)
 		return
+	}
+	fileName := filepath.Base(filePath)
+
+	// Store in broadcast directory
+	bcDir := filepath.Join(h.cfg.SharedDir, "broadcast")
+	os.MkdirAll(bcDir, 0755)
+	ts := time.Now().Format("20060102-150405")
+	storedName := fmt.Sprintf("%s_%s", ts, fileName)
+	storedPath := filepath.Join(bcDir, storedName)
+	os.WriteFile(storedPath, data, 0644)
+
+	// Build download URL (clients will GET this)
+	st, _ := h.lc.Status(r.Context())
+	serverIP := "localhost"
+	if st != nil && len(st.TailscaleIPs) > 0 {
+		serverIP = st.TailscaleIPs[0].String()
+	}
+	downloadURL := fmt.Sprintf("http://%s:%d/files/broadcast/%s", serverIP, h.cfg.Port, storedName)
+
+	// Push SSE notification to connected clients
+	event := Event{
+		Type: "broadcast",
+		Payload: BroadcastPayload{
+			File:  fileName,
+			Path:  storedPath,
+			From:  nodeName,
+			Group: group,
+			Size:  int64(len(data)),
+			URL:   downloadURL,
+		},
+	}
+
+	if h.broker != nil {
+		if len(req.Targets) > 0 {
+			h.broker.Publish(event, req.Targets...)
+		} else {
+			h.broker.Publish(event)
+		}
+	}
+
+	connected := 0
+	if h.broker != nil {
+		connected = len(h.broker.ConnectedClients())
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(results)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":    "ok",
+		"file":      storedName,
+		"url":       downloadURL,
+		"notified":  connected,
+		"group":     group,
+	})
 }

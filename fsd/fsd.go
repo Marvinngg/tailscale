@@ -28,6 +28,7 @@ type Service struct {
 	lc       tailscale.LocalClient
 	server   *http.Server
 	handlers *Handlers
+	broker   *Broker
 }
 
 // Config defines the file service configuration.
@@ -36,6 +37,7 @@ type Config struct {
 	SharedDir  string `json:"sharedDir"`  // shared space path
 	InboxDir   string `json:"inboxDir"`   // inbox metadata path
 	ReceiveDir string `json:"receiveDir"` // auto-receive directory (e.g. ~/Downloads)
+	ServerAddr string `json:"serverAddr"` // fsd server to subscribe to (e.g. "100.64.0.1:7700")
 }
 
 // DefaultConfig returns a default configuration based on OS.
@@ -83,6 +85,8 @@ func (s *Service) Start(ctx context.Context) error {
 	os.MkdirAll(s.cfg.InboxDir, 0755)
 
 	s.handlers = NewHandlers(s.cfg, &s.lc)
+	s.broker = NewBroker()
+	s.handlers.broker = s.broker
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/files/", s.handlers.HandleFiles)
@@ -90,6 +94,7 @@ func (s *Service) Start(ctx context.Context) error {
 	mux.HandleFunc("/inbox", s.handlers.HandleInbox)
 	mux.HandleFunc("/inbox/", s.handlers.HandleInbox)
 	mux.HandleFunc("/broadcast", s.handlers.HandleBroadcast)
+	mux.HandleFunc("/events", s.broker.HandleSSE)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok"))
 	})
@@ -133,6 +138,14 @@ func (s *Service) Start(ctx context.Context) error {
 		}
 
 		log.Printf("fsd: serving on %s (shared=%s, inbox=%s)", addr, s.cfg.SharedDir, s.cfg.InboxDir)
+
+		// Start SSE subscriber to the exit node / server's fsd.
+		// This enables receiving broadcast notifications in real time.
+		if s.cfg.ServerAddr != "" {
+			sub := NewSubscriber(&s.lc, s.cfg, s.cfg.ServerAddr)
+			go sub.Run(ctx)
+			log.Printf("fsd: SSE subscribing to %s", s.cfg.ServerAddr)
+		}
 
 		go func() {
 			<-ctx.Done()
