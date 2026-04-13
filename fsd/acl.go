@@ -2,160 +2,222 @@ package fsd
 
 import (
 	"encoding/json"
+	"log"
 	"os"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"sync"
+	"time"
 )
 
-// ACL defines file service access control.
+// ACL defines file service access control policy.
+//
+// Roles are derived from Headscale Node Tags (tag:fs-admin, tag:fs-agent).
+// This file only defines WHAT each role can do, not WHO has which role.
+//
+// Three roles (hierarchical):
+//   admin  — system administrator, full access (tag:fs-admin)
+//   agent  — middle management, most access (tag:fs-agent)
+//   user   — regular user, minimal access (no fs tag)
 type ACL struct {
-	// Roles maps Headscale login name → role name.
-	// e.g. "admin-marvin" → "admin"
-	Roles map[string]string `json:"roles"`
-
-	// Library maps directory path → list of roles that can access it.
-	// e.g. "public/" → ["admin","developer","compute","member"]
+	// Library maps directory → list of roles that can see/download it.
 	Library map[string][]string `json:"library"`
 
-	// Broadcast lists roles that can send to all/groups.
-	Broadcast []string `json:"broadcast"`
-}
+	// Upload lists roles that can upload to the library.
+	Upload []string `json:"upload"`
 
-// Permission levels
-const (
-	PermNone      = ""
-	PermRead      = "read"
-	PermWrite     = "write"
-	PermAdmin     = "admin"
-	PermBroadcast = "broadcast"
-)
+	// Delete lists roles that can delete from the library.
+	Delete []string `json:"delete"`
+
+	// Broadcast lists roles that can broadcast to all.
+	Broadcast []string `json:"broadcast"`
+
+	// BroadcastGroup lists roles that can broadcast to a specific group.
+	BroadcastGroup []string `json:"broadcast_group"`
+}
 
 var (
-	aclOnce     sync.Once
-	cachedACL   *ACL
-	aclFilePath string
+	aclMu      sync.RWMutex
+	cachedACL  *ACL
+	aclPath    string
+	aclModTime time.Time
 )
 
-// aclConfigPath returns the path to fs-acl.json.
-func aclConfigPath() string {
+// aclConfigPaths returns possible paths to fs-acl.json.
+func aclConfigPaths() []string {
 	if runtime.GOOS == "windows" {
-		return filepath.Join(os.Getenv("ProgramData"), "Tailscale", "fs-acl.json")
-	}
-	// Try /Library/Tailscale first (macOS), then /etc/tailscale (Linux)
-	for _, p := range []string{
-		"/Library/Tailscale/fs-acl.json",
-		"/etc/tailscale/fs-acl.json",
-	} {
-		if _, err := os.Stat(p); err == nil {
-			return p
+		return []string{
+			filepath.Join(os.Getenv("ProgramData"), "Tailscale", "fs-acl.json"),
 		}
 	}
-	return "/Library/Tailscale/fs-acl.json"
+	return []string{
+		"/etc/tailscale/fs-acl.json",
+		"/Library/Tailscale/fs-acl.json",
+	}
 }
 
-// LoadACL loads the ACL config. Returns nil if no config file exists
-// (meaning no permission enforcement — open access).
-func LoadACL() *ACL {
-	path := aclConfigPath()
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil // no ACL file = open access
+func loadACL() (*ACL, string) {
+	for _, p := range aclConfigPaths() {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		var acl ACL
+		if err := json.Unmarshal(data, &acl); err != nil {
+			log.Printf("fsd: ACL parse error in %s: %v", p, err)
+			continue
+		}
+		return &acl, p
 	}
-	var acl ACL
-	if err := json.Unmarshal(data, &acl); err != nil {
-		return nil
-	}
-	aclFilePath = path
-	return &acl
+	return nil, ""
 }
 
-// GetACL returns the cached ACL, loading once.
+// GetACL returns the current ACL policy. Auto-reloads on file change.
+// Returns nil if no ACL file exists (open access, everyone is admin).
 func GetACL() *ACL {
-	aclOnce.Do(func() {
-		cachedACL = LoadACL()
-	})
+	aclMu.RLock()
+	if aclPath != "" {
+		if info, err := os.Stat(aclPath); err == nil && info.ModTime().Equal(aclModTime) {
+			defer aclMu.RUnlock()
+			return cachedACL
+		}
+	}
+	aclMu.RUnlock()
+
+	aclMu.Lock()
+	defer aclMu.Unlock()
+
+	acl, path := loadACL()
+	if acl != nil {
+		if path != aclPath {
+			log.Printf("fsd: ACL loaded from %s", path)
+		} else {
+			log.Printf("fsd: ACL reloaded from %s", path)
+		}
+		cachedACL = acl
+		aclPath = path
+		if info, err := os.Stat(path); err == nil {
+			aclModTime = info.ModTime()
+		}
+	} else {
+		cachedACL = nil
+		aclPath = ""
+	}
 	return cachedACL
 }
 
-// ReloadACL forces a reload of the ACL config.
-func ReloadACL() *ACL {
-	aclOnce = sync.Once{}
-	return GetACL()
+// RoleFromTags derives the fsd role from Headscale node tags.
+//
+//   tag:fs-admin → "admin"
+//   tag:fs-agent → "agent"
+//   (no fs tag)  → "user"
+//
+// This is the single source of truth for role assignment.
+// Tags are set when creating preauthkeys or via headscale nodes tag.
+func RoleFromTags(tags []string) string {
+	for _, t := range tags {
+		if t == "tag:fs-admin" {
+			return "admin"
+		}
+	}
+	for _, t := range tags {
+		if t == "tag:fs-agent" {
+			return "agent"
+		}
+	}
+	return "user"
 }
 
-// IsServerMode returns true if an ACL config file exists,
-// meaning this node acts as a file library server.
-func IsServerMode() bool {
-	return GetACL() != nil
-}
+// CanAccessLibrary checks if a role can browse/download a library path.
+func CanAccessLibrary(acl *ACL, role, path string) bool {
+	if acl == nil || role == "admin" {
+		return true
+	}
 
-// RoleFor returns the role for a given Headscale login name.
-func (a *ACL) RoleFor(loginName string) string {
-	if a == nil {
-		return PermAdmin // no ACL = full access
-	}
-	if role, ok := a.Roles[loginName]; ok {
-		return role
-	}
-	// Try prefix match (e.g. "admin-marvin" matches "admin-")
-	for pattern, role := range a.Roles {
-		if strings.HasSuffix(pattern, "*") {
-			prefix := strings.TrimSuffix(pattern, "*")
-			if strings.HasPrefix(loginName, prefix) {
-				return role
+	// Find the best matching directory rule
+	bestMatch := ""
+	for dirPattern := range acl.Library {
+		dirClean := dirPattern
+		if dirClean != "" && dirClean[len(dirClean)-1] == '/' {
+			dirClean = dirClean[:len(dirClean)-1]
+		}
+		if path == dirClean || hasPrefix(path, dirPattern) {
+			if len(dirPattern) > len(bestMatch) {
+				bestMatch = dirPattern
 			}
 		}
 	}
-	return "guest"
-}
 
-// CanAccessLibrary checks if a role can access a library path.
-func (a *ACL) CanAccessLibrary(role, path string) bool {
-	if a == nil || role == "admin" {
-		return true
+	if bestMatch == "" {
+		return role == "admin"
 	}
-	// Check each library path rule
-	for dirPattern, allowedRoles := range a.Library {
-		if strings.HasPrefix(path, dirPattern) || dirPattern == "*" {
-			for _, r := range allowedRoles {
-				if r == role || r == "*" {
-					return true
-				}
-			}
-			return false
-		}
-	}
-	// No matching rule = deny for non-admin
-	return false
-}
 
-// CanBroadcast checks if a role can send broadcast/group messages.
-func (a *ACL) CanBroadcast(role string) bool {
-	if a == nil || role == "admin" {
-		return true
-	}
-	for _, r := range a.Broadcast {
-		if r == role || r == "*" {
+	for _, r := range acl.Library[bestMatch] {
+		if r == role {
 			return true
 		}
 	}
 	return false
 }
 
-// CanUploadLibrary checks if a role can upload to the library.
-func (a *ACL) CanUploadLibrary(role string) bool {
-	if a == nil {
+func hasPrefix(path, prefix string) bool {
+	if prefix == "" {
 		return true
 	}
-	return role == "admin" || role == "developer" || role == "server"
+	if prefix[len(prefix)-1] != '/' {
+		prefix += "/"
+	}
+	return len(path) >= len(prefix) && path[:len(prefix)] == prefix
 }
 
-// CanDeleteLibrary checks if a role can delete from the library.
-func (a *ACL) CanDeleteLibrary(role string) bool {
-	if a == nil {
+// CanUpload checks if a role can upload to the library.
+func CanUpload(acl *ACL, role string) bool {
+	if acl == nil || role == "admin" {
 		return true
 	}
-	return role == "admin" || role == "server"
+	for _, r := range acl.Upload {
+		if r == role {
+			return true
+		}
+	}
+	return false
+}
+
+// CanDelete checks if a role can delete from the library.
+func CanDelete(acl *ACL, role string) bool {
+	if acl == nil || role == "admin" {
+		return true
+	}
+	for _, r := range acl.Delete {
+		if r == role {
+			return true
+		}
+	}
+	return false
+}
+
+// CanBroadcastAll checks if a role can broadcast to everyone.
+func CanBroadcastAll(acl *ACL, role string) bool {
+	if acl == nil || role == "admin" {
+		return true
+	}
+	for _, r := range acl.Broadcast {
+		if r == role {
+			return true
+		}
+	}
+	return false
+}
+
+// CanBroadcastGroup checks if a role can broadcast to a specific group.
+func CanBroadcastGroup(acl *ACL, role string) bool {
+	if acl == nil || role == "admin" {
+		return true
+	}
+	for _, r := range acl.BroadcastGroup {
+		if r == role {
+			return true
+		}
+	}
+	return false
 }

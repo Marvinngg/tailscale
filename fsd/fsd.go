@@ -104,7 +104,11 @@ func (s *Service) Start(ctx context.Context) error {
 			http.Error(w, "admin only", http.StatusForbidden)
 			return
 		}
-		acl := ReloadACL()
+		// Force reload by resetting mod time
+		aclMu.Lock()
+		aclModTime = time.Time{}
+		aclMu.Unlock()
+		acl := GetACL()
 		if acl == nil {
 			w.Write([]byte(`{"status":"no acl file"}`))
 		} else {

@@ -49,15 +49,16 @@ func withAuth(lc *tailscale.LocalClient, next http.Handler) http.Handler {
 		if err == nil {
 			nodeName = whois.Node.ComputedName
 			userName = whois.UserProfile.LoginName
-			acl := GetACL()
-			role = "admin" // default: no ACL = full access
-			if acl != nil {
-				role = acl.RoleFor(userName)
+			// Role from Headscale node tags (tag:fs-admin, tag:fs-agent)
+			var tags []string
+			for _, t := range whois.Node.Tags {
+				tags = append(tags, t)
 			}
+			role = RoleFromTags(tags)
 		} else {
 			nodeName = remoteIP
 			userName = "unknown"
-			role = "guest"
+			role = "user"
 		}
 
 		log.Printf("fsd: %s %s from %s (%s/%s role=%s)", r.Method, r.URL.Path, remoteIP, nodeName, userName, role)

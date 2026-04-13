@@ -165,22 +165,27 @@ func resolveGroup(ctx context.Context, lc *tailscale.LocalClient, group string) 
 			continue
 		}
 
-		// Match by Headscale user login name or ACL role
+		// Match by Headscale user login name
 		if u, ok := st.User[peer.UserID]; ok {
 			loginName := u.LoginName
-
-			// Direct user name match
 			if loginName == group || strings.HasPrefix(loginName, group+"@") {
 				nodes = append(nodes, peer.HostName)
 				continue
 			}
+		}
 
-			// ACL role match: if group="developer", match all users with role "developer"
-			acl := GetACL()
-			if acl != nil {
-				role := acl.RoleFor(loginName)
-				if role == group {
-					nodes = append(nodes, peer.HostName)
+		// Match by fsd role (from node tags)
+		if group == "admin" || group == "agent" || group == "user" {
+			if len(peer.TailscaleIPs) > 0 {
+				peerAddr := peer.TailscaleIPs[0].String() + ":1"
+				if whois, err := lc.WhoIs(ctx, peerAddr); err == nil {
+					var tags []string
+					for _, t := range whois.Node.Tags {
+						tags = append(tags, t)
+					}
+					if RoleFromTags(tags) == group {
+						nodes = append(nodes, peer.HostName)
+					}
 				}
 			}
 		}

@@ -41,19 +41,19 @@ func (h *Handlers) HandleFiles(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
-		if acl != nil && !acl.CanAccessLibrary(role, subpath) {
+		if !CanAccessLibrary(acl, role, subpath) {
 			http.Error(w, "permission denied", http.StatusForbidden)
 			return
 		}
 		h.getFile(w, r, localPath)
 	case http.MethodPut:
-		if acl != nil && !acl.CanUploadLibrary(role) {
+		if !CanUpload(acl, role) {
 			http.Error(w, "permission denied: cannot upload", http.StatusForbidden)
 			return
 		}
 		h.putFile(w, r, localPath)
 	case http.MethodDelete:
-		if acl != nil && !acl.CanDeleteLibrary(role) {
+		if !CanDelete(acl, role) {
 			http.Error(w, "permission denied: cannot delete", http.StatusForbidden)
 			return
 		}
@@ -305,10 +305,6 @@ func (h *Handlers) HandleBroadcast(w http.ResponseWriter, r *http.Request) {
 
 	nodeName, _, role := CallerInfo(r)
 	acl := GetACL()
-	if acl != nil && !acl.CanBroadcast(role) {
-		http.Error(w, "permission denied: cannot broadcast", http.StatusForbidden)
-		return
-	}
 
 	var req SendRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -319,6 +315,19 @@ func (h *Handlers) HandleBroadcast(w http.ResponseWriter, r *http.Request) {
 	group := req.Group
 	if group == "" && len(req.Targets) == 0 {
 		group = "all"
+	}
+
+	// Permission check: broadcast all vs broadcast group
+	if group == "all" {
+		if !CanBroadcastAll(acl, role) {
+			http.Error(w, "permission denied: only admin can broadcast to all", http.StatusForbidden)
+			return
+		}
+	} else {
+		if !CanBroadcastGroup(acl, role) {
+			http.Error(w, "permission denied: cannot broadcast to group", http.StatusForbidden)
+			return
+		}
 	}
 
 	// Read the file
