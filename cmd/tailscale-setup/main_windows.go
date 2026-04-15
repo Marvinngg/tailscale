@@ -1,11 +1,11 @@
-// setup.exe: install Enhanced Tailscale on Windows.
-// 1. Auto-download official installer (driver, firewall, service)
-// 2. Run it silently
-// 3. Replace binaries with our enhanced versions
-// 4. Start service
+// setup.exe: install Marvin Tailscale on Windows.
 //
-// User flow: unzip → double-click setup.exe → done
-// Then: tailscale up --login-server=https://xxx --auth-key=xxx
+// Architecture: install official MSI first (provides tailscale-ipn.exe,
+// WinTun driver, service framework, session management), then replace
+// tailscaled.exe and tailscale.exe with our enhanced versions.
+//
+// tailscale-ipn.exe is REQUIRED on Windows — it maintains the daemon
+// session. Without it, every CLI connection triggers profile switch loops.
 package main
 
 import (
@@ -23,9 +23,9 @@ import (
 )
 
 const (
-	installDir   = `C:\Program Files\Tailscale`
-	officialURL  = "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe"
-	installerExe = "tailscale-install.exe"
+	installDir = `C:\Program Files\Tailscale`
+	msiURL     = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+	msiFile    = "tailscale-setup.msi"
 )
 
 func main() {
@@ -35,7 +35,7 @@ func main() {
 	}
 
 	fmt.Println()
-	fmt.Println("  Antigravity Tailscale Setup")
+	fmt.Println("  Marvin Tailscale Setup")
 	fmt.Println()
 
 	srcDir := filepath.Dir(os.Args[0])
@@ -52,45 +52,49 @@ func main() {
 		}
 	}
 
-	// Step 1: Get official installer (download if not present)
-	installerPath := filepath.Join(srcDir, installerExe)
-	if _, err := os.Stat(installerPath); err != nil {
-		fmt.Println("  [1/4] Downloading official Tailscale installer...")
-		if err := downloadFile(installerPath, officialURL); err != nil {
+	// Step 1: Get MSI (download if not present)
+	msiPath := filepath.Join(srcDir, msiFile)
+	if fi, err := os.Stat(msiPath); err != nil || fi.Size() < 10*1024*1024 {
+		fmt.Println("  [1/4] Downloading official Tailscale MSI (~35MB)...")
+		if err := downloadFile(msiPath, msiURL); err != nil {
 			fmt.Printf("  Download failed: %v\n", err)
-			fmt.Println("  You can manually download from:")
-			fmt.Printf("    %s\n", officialURL)
-			fmt.Printf("  Save as: %s\n", installerPath)
+			fmt.Println("  You can manually download:")
+			fmt.Printf("    %s\n", msiURL)
 			wait()
 			return
 		}
-		fmt.Println("  Downloaded.")
+		fi, _ = os.Stat(msiPath)
+		fmt.Printf("  Downloaded (%d MB).\n", fi.Size()/1024/1024)
 	} else {
-		fmt.Println("  [1/4] Official installer found.")
+		fmt.Printf("  [1/4] MSI found (%d MB).\n", fi.Size()/1024/1024)
 	}
 
-	// Step 2: Run official installer silently
-	fmt.Println("  [2/4] Installing base system (driver, firewall, service)...")
-	out, err := exec.Command(installerPath, "/S").CombinedOutput()
+	// Step 2: Install MSI silently
+	fmt.Println("  [2/4] Installing base system...")
+	exec.Command("taskkill", "/F", "/IM", "tailscale-ipn.exe").Run()
+	exec.Command("net", "stop", "Tailscale").Run()
+	time.Sleep(2 * time.Second)
+
+	out, err := exec.Command("msiexec", "/i", msiPath, "/quiet", "/norestart").CombinedOutput()
 	if err != nil {
-		out, err = exec.Command(installerPath, "/quiet", "/norestart").CombinedOutput()
-	}
-	if err != nil {
-		fmt.Printf("  Installer: %s (%v)\n", strings.TrimSpace(string(out)), err)
+		fmt.Printf("  MSI: %s (%v)\n", strings.TrimSpace(string(out)), err)
 	}
 
 	// Wait for service
 	fmt.Println("  Waiting for service...")
-	for i := 0; i < 30; i++ {
+	for i := 0; i < 60; i++ {
 		out, _ := exec.Command("sc.exe", "query", "Tailscale").CombinedOutput()
 		if strings.Contains(string(out), "RUNNING") {
 			break
+		}
+		if strings.Contains(string(out), "STOPPED") {
+			exec.Command("net", "start", "Tailscale").Run()
 		}
 		time.Sleep(2 * time.Second)
 	}
 	time.Sleep(3 * time.Second)
 
-	// Step 3: Stop service and replace binaries
+	// Step 3: Stop and replace our binaries
 	fmt.Println("  [3/4] Replacing with enhanced version...")
 	exec.Command("taskkill", "/F", "/IM", "tailscale-ipn.exe").Run()
 	exec.Command("net", "stop", "Tailscale").Run()
@@ -100,16 +104,10 @@ func main() {
 		src := filepath.Join(srcDir, f)
 		dst := filepath.Join(installDir, f)
 		if err := copyFile(src, dst); err != nil {
-			fmt.Printf("  ERROR replacing %s: %v\n", f, err)
+			fmt.Printf("  ERROR: %s: %v\n", f, err)
 			wait()
 			return
 		}
-	}
-
-	// Copy GUI if present
-	guiSrc := filepath.Join(srcDir, "tailscale-gui.exe")
-	if _, err := os.Stat(guiSrc); err == nil {
-		copyFile(guiSrc, filepath.Join(installDir, "tailscale-gui.exe"))
 	}
 
 	// Create data directories
@@ -117,13 +115,19 @@ func main() {
 	os.MkdirAll(filepath.Join(dataDir, "shared"), 0755)
 	os.MkdirAll(filepath.Join(dataDir, "inbox"), 0755)
 
-	// Step 4: Start service
+	// Step 4: Start service + GUI
 	fmt.Println("  [4/4] Starting service...")
 	exec.Command("net", "start", "Tailscale").Run()
-	time.Sleep(5 * time.Second)
+	time.Sleep(3 * time.Second)
 
-	// Launch official GUI
-	exec.Command(filepath.Join(installDir, "tailscale-ipn.exe")).Start()
+	// Launch the GUI (maintains session, prevents profile switch loops)
+	ipnPath := filepath.Join(installDir, "tailscale-ipn.exe")
+	if _, err := os.Stat(ipnPath); err == nil {
+		exec.Command(ipnPath).Start()
+		fmt.Println("  GUI started.")
+	}
+
+	time.Sleep(5 * time.Second)
 
 	// Verify
 	out, _ = exec.Command(filepath.Join(installDir, "tailscale.exe"), "version").CombinedOutput()
@@ -141,10 +145,8 @@ func main() {
 	}
 	fmt.Printf("  Version: %s\n", ver)
 	fmt.Println()
-	fmt.Println("  Next step - run this command to connect:")
-	fmt.Println()
+	fmt.Println("  Next step:")
 	fmt.Println("    tailscale up --login-server=https://hs.marvinai.qzz.io:8443 --auth-key=YOUR_KEY --exit-node=100.64.0.1 --exit-node-allow-lan-access --accept-dns=false")
-	fmt.Println()
 	fmt.Println("  ========================================")
 	wait()
 }
@@ -155,17 +157,14 @@ func downloadFile(dst, url string) error {
 		return err
 	}
 	defer resp.Body.Close()
-
 	if resp.StatusCode != 200 {
 		return fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
-
 	f, err := os.Create(dst)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-
 	size, err := io.Copy(f, resp.Body)
 	if err != nil {
 		return err

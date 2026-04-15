@@ -582,6 +582,7 @@ func startIPNServer(ctx context.Context, logf logger.Logf, logID logid.PublicID,
 				}
 			}
 			// Start the file service (fsd) in the background.
+			// fsd waits for backend Running state before connecting.
 			go func() {
 				cfg := fsd.DefaultConfig()
 				// Daemon runs as root/SYSTEM, detect the real logged-in

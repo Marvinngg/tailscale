@@ -163,17 +163,49 @@ func (s *Service) Start(ctx context.Context) error {
 	}
 }
 
-// waitForTailnetIP polls tailscaled until we have a Tailnet IP.
+// waitForTailnetIP finds the Tailscale IP by scanning network interfaces.
+// Does NOT use LocalClient to avoid triggering profile switch on Windows.
 func (s *Service) waitForTailnetIP(ctx context.Context) (string, error) {
 	for {
-		st, err := s.lc.Status(ctx)
-		if err == nil && len(st.TailscaleIPs) > 0 {
-			return st.TailscaleIPs[0].String(), nil
+		ip := findTailscaleIP()
+		if ip != "" {
+			return ip, nil
 		}
 		select {
 		case <-ctx.Done():
 			return "", ctx.Err()
-		case <-time.After(2 * time.Second):
+		case <-time.After(5 * time.Second):
 		}
 	}
+}
+
+// findTailscaleIP scans network interfaces for a Tailscale CGNAT IP (100.64.0.0/10).
+func findTailscaleIP() string {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return ""
+	}
+	for _, iface := range ifaces {
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			if ip == nil || ip.To4() == nil {
+				continue
+			}
+			// Tailscale CGNAT: 100.64.0.0/10
+			if ip[0] == 100 && ip[1] >= 64 && ip[1] <= 127 {
+				return ip.String()
+			}
+		}
+	}
+	return ""
 }
