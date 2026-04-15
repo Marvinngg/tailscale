@@ -64,16 +64,59 @@ if [ "$(uname -s)" != "Darwin" ]; then
   exit 1
 fi
 
-# ── step 1: stop existing services ─────────────────────────────────
-echo "[1/6] Stopping existing services..."
+# ── step 1: clean up ALL existing Tailscale installations ─────────
+echo "[1/6] Cleaning up existing Tailscale..."
+
+# Stop our daemon
 launchctl unload "$DAEMON_PLIST" 2>/dev/null || true
 su "$REAL_USER" -c "launchctl unload '$RECEIVER_PLIST' 2>/dev/null" || true
-sleep 1
-pkill -x tailscaled 2>/dev/null || true
-sleep 1
-# clean stale tunnel routes
+
+# Stop official App Store / standalone Tailscale
+su "$REAL_USER" -c 'osascript -e "quit app \"Tailscale\"" 2>/dev/null' || true
+
+# Kill any running tailscaled regardless of source
+pkill -9 -x tailscaled 2>/dev/null || true
+sleep 2
+
+# Remove official App Store version
+if [ -d "/Applications/Tailscale.app/Contents/_MASReceipt" ]; then
+  echo "  Removing App Store Tailscale..."
+  rm -rf "/Applications/Tailscale.app"
+fi
+
+# Remove official standalone version (but keep state for migration)
+if [ -d "/Applications/Tailscale.app" ] && [ ! -d "/Applications/Tailscale.app/Contents/_MASReceipt" ]; then
+  echo "  Removing standalone Tailscale.app..."
+  rm -rf "/Applications/Tailscale.app"
+fi
+
+# Remove brew-installed tailscale (if present)
+if command -v brew &>/dev/null && brew list tailscale &>/dev/null 2>&1; then
+  echo "  Removing brew Tailscale..."
+  brew uninstall tailscale 2>/dev/null || true
+fi
+
+# Remove old binaries from any location
+rm -f /usr/local/bin/tailscaled /usr/local/bin/tailscale 2>/dev/null || true
+
+# Remove old LaunchDaemons (various names used by different versions)
+for plist in \
+  /Library/LaunchDaemons/com.tailscale.tailscaled.plist \
+  /Library/LaunchDaemons/com.tailscale.*.plist; do
+  launchctl unload "$plist" 2>/dev/null || true
+done
+
+# Remove old LaunchAgents
+su "$REAL_USER" -c 'launchctl unload ~/Library/LaunchAgents/com.tailscale.*.plist 2>/dev/null' || true
+launchctl unload /Library/LaunchAgents/com.tailscale.*.plist 2>/dev/null || true
+
+# Clean stale tunnel routes
 route -q -n delete -inet 0/1 2>/dev/null || true
 route -q -n delete -inet 128.0/1 2>/dev/null || true
+route -q -n delete -inet6 ::/1 2>/dev/null || true
+route -q -n delete -inet6 8000::/1 2>/dev/null || true
+
+echo "  Cleanup done."
 
 # ── step 2: download binaries ──────────────────────────────────────
 echo "[2/6] Downloading binaries..."
