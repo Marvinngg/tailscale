@@ -347,18 +347,15 @@ func (e *Extension) FileTargets() ([]*apitype.FileTarget, error) {
 		return nil, errors.New("file sharing not enabled by Tailscale admin")
 	}
 	nb := e.nodeBackend()
+	// fork: 与同模块 taildropTargetStatus 行为对齐 — 允许所有 tailnet peer
+	// 互传文件, 访问控制由网络层 ACL (packetFilter) 负责. 上游 selfUID/
+	// PeerCap 过滤在我们的部署里没有意义 (节点跨 user/tag 是常态).
+	_ = self
 	peers := nb.AppendMatchingPeers(nil, func(p tailcfg.NodeView) bool {
 		if !p.Valid() || p.Hostinfo().OS() == "tvOS" {
 			return false
 		}
-		if self == p.User() {
-			return true
-		}
-		if nb.PeerHasCap(p, tailcfg.PeerCapabilityFileSharingTarget) {
-			// Explicitly noted in the netmap ACL caps as a target.
-			return true
-		}
-		return false
+		return true
 	})
 	for _, p := range peers {
 		peerAPI := nb.PeerAPIBase(p)

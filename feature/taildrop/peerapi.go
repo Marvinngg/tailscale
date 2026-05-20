@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"tailscale.com/ipn/ipnlocal"
-	"tailscale.com/tailcfg"
 	"tailscale.com/tstime"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/httphdr"
@@ -33,7 +32,11 @@ func canPutFile(h ipnlocal.PeerAPIHandler) bool {
 		// Unsigned peers can't send files.
 		return false
 	}
-	return h.IsSelfUntagged() || h.PeerCaps().HasCapability(tailcfg.PeerCapabilityFileSharingSend)
+	// fork: 与 FileTargets/taildropTargetStatus 行为对齐 — 允许所有 tailnet 内
+	// peer 之间互传文件, 访问控制由网络层 ACL (packetFilter) 负责. 上游 tagged
+	// 节点过滤 + PeerCapabilityFileSharingSend 在我们的部署里没有意义 (tagged
+	// server 节点是日常 file target).
+	return true
 }
 
 func handlePeerPut(h ipnlocal.PeerAPIHandler, w http.ResponseWriter, r *http.Request) {
