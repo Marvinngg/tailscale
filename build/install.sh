@@ -3,21 +3,21 @@ set -e
 
 # ── Antigravity Tailscale Installer (macOS) ─────────────────────────
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/Marvinngg/tailscale/antigravity/v1.94.2-macos-exitnode/build/install.sh | sudo bash -s -- --key=hskey-auth-xxxx
+#   curl -fsSL https://github.com/Marvinngg/tailscale/releases/download/v1.94.2-ag2/install.sh | sudo bash -s -- --key=hskey-auth-xxxx
 #
 # Options:
 #   --key=KEY          Headscale pre-auth key (required)
-#   --server=URL       Headscale server (default: https://hs.marvinai.qzz.io:8443)
-#   --exit-node=IP     Exit node IP (default: 100.64.0.1)
+#   --server=URL       Headscale server (default: https://hs.263onet.com:8443)
+#   --exit-node=IP     Exit node IP (default: 100.96.0.1)
 #   --no-exit-node     Don't set exit node
 # ─────────────────────────────────────────────────────────────────────
 
-HEADSCALE_URL="https://hs.marvinai.qzz.io:8443"
-EXIT_NODE="100.64.0.1"
+HEADSCALE_URL="https://hs.263onet.com:8443"
+EXIT_NODE="100.96.0.1"
 AUTH_KEY=""
 DAEMON_PLIST="/Library/LaunchDaemons/com.tailscale.tailscaled.plist"
 RECEIVER_PLIST="/Library/LaunchAgents/com.tailscale.file-receiver.plist"
-RELEASE_URL="https://github.com/Marvinngg/tailscale/releases/download/v1.94.2-ag1"
+RELEASE_URL="https://github.com/Marvinngg/tailscale/releases/download/v1.94.2-ag2"
 
 # ── parse args ──────────────────────────────────────────────────────
 for arg in "$@"; do
@@ -65,7 +65,7 @@ if [ "$(uname -s)" != "Darwin" ]; then
 fi
 
 # ── step 1: clean up ALL existing Tailscale installations ─────────
-echo "[1/6] Cleaning up existing Tailscale..."
+echo "[1/7] Cleaning up existing Tailscale..."
 
 # Stop our daemon
 launchctl unload "$DAEMON_PLIST" 2>/dev/null || true
@@ -119,7 +119,7 @@ route -q -n delete -inet6 8000::/1 2>/dev/null || true
 echo "  Cleanup done."
 
 # ── step 2: download binaries ──────────────────────────────────────
-echo "[2/6] Downloading binaries..."
+echo "[2/7] Downloading binaries..."
 TMPDIR=$(mktemp -d)
 DOWNLOAD_OK=true
 curl -fsSL -o "$TMPDIR/tailscaled" "$RELEASE_URL/tailscaled-darwin-${ARCH}" 2>/dev/null || DOWNLOAD_OK=false
@@ -139,7 +139,7 @@ if [ "$DOWNLOAD_OK" = false ]; then
 fi
 
 # ── step 3: install binaries and directories ───────────────────────
-echo "[3/6] Installing binaries..."
+echo "[3/7] Installing binaries..."
 install -m 755 "$TMPDIR/tailscaled" /usr/local/bin/tailscaled
 install -m 755 "$TMPDIR/tailscale"  /usr/local/bin/tailscale
 rm -rf "$TMPDIR"
@@ -151,8 +151,51 @@ codesign --force --sign - /usr/local/bin/tailscale  2>/dev/null || true
 mkdir -p /var/run/tailscale
 mkdir -p /Library/Tailscale
 
-# ── step 4: write LaunchDaemon (tailscaled) ────────────────────────
-echo "[4/6] Configuring daemon..."
+# ── step 4: install 263onet self-signed CA into System keychain ────
+# (required so tailscale CLI / tailscaled can TLS to https://hs.263onet.com:8443)
+echo "[4/7] Installing 263onet CA certificate..."
+CA_PATH=$(mktemp -t 263onet-ca.XXXXXX.crt)
+cat > "$CA_PATH" << 'CERT'
+-----BEGIN CERTIFICATE-----
+MIIFbzCCA1egAwIBAgIUFxzvTe4cYNMTVv6n9/kODXlVOFAwDQYJKoZIhvcNAQEL
+BQAwRzELMAkGA1UEBhMCQ04xEDAOBgNVBAoMBzI2M29uZXQxJjAkBgNVBAMMHTI2
+M29uZXQgSW50ZXJuYWwgSGVhZHNjYWxlIENBMB4XDTI2MDUwODA3MzUzN1oXDTM2
+MDUwNTA3MzUzN1owRzELMAkGA1UEBhMCQ04xEDAOBgNVBAoMBzI2M29uZXQxJjAk
+BgNVBAMMHTI2M29uZXQgSW50ZXJuYWwgSGVhZHNjYWxlIENBMIICIjANBgkqhkiG
+9w0BAQEFAAOCAg8AMIICCgKCAgEAzHnVAdVpxukt9CHT3QtFZAbMz1Pe9Fr4Z0fC
+YwjZSZIQHozReH4fFEbvmUf33+2Bg527QOKyVXnUjvCK8h4T6byD8Igt293kz3yw
+dL9Pvn6YdZaJqkeagG0hvlrnTSAy/hLIUUcThPMdx4TwwMSuLtqkG+V/hXfNOAmp
+7BhHDv3YzHYvYJ59Dijf+sIp7+wqYRmwvZ8MfNZDMfnHzqRwl27C2kZitY/fcZkr
+I79c7OAenR6rdDJzjy9mxscKylga4cqiQvKem8OWnYBM4XMsJKGB8P2wUMfg63Ca
+rCp9iSiIGpHeEyyuVm9yTCFYrmiImpVGRh9CB5zjlr3FBFzzY3TNXNDmczCcI11m
+pYtd9XteALvWOo/Snz/YIvqHU2vToA+IAIP2smJQXFBmdv98Cta5n72JjbyvDhXO
+CO+0OT04Yv3zgWDDfvEVQHiwu0Us46B/IxIEF8tY+e/Wbwt+EZskMwIREldz+lW2
+AWFhf/Ol+GqklcSZ2XwN+m7uAt1XBiKTLDs7gNvBuUIvczTfMo/s+Do1R8ZylWZk
+QmwnseMxPobkFnjVlPTQ2duJ/4D73OhjfNDq1YFaSMRDBWOKVYVZEKKRbp0CbQZ4
+/t9Bx/CqUa7gri8NYypP6dISjQU/jB6HvsuaaVdxQrk9NedvZmxtmJprGnVS3hbC
+tLJwSLUCAwEAAaNTMFEwHQYDVR0OBBYEFB23tWBo+PMUo+qUphOg80PQ/iSfMB8G
+A1UdIwQYMBaAFB23tWBo+PMUo+qUphOg80PQ/iSfMA8GA1UdEwEB/wQFMAMBAf8w
+DQYJKoZIhvcNAQELBQADggIBAI0be/wFVAll+Zoqk2nDm0eDxJ4pd1mof+plTkk7
+xu9p+NjQk4DVnvHyxKTNBuS8I0Ebu6BeCeaUKH2oirjxIKoUGz5/MhWQ7oWOdbDp
+mpye+w2P1tHb5qJHAqSuPr9w3ubpIbBnO0qGqGGGg/o9E9XC6x5LUbMMj/cfwEIi
+LtsIqNF4t9cLKzn617wgiMj2O129zMM2ERYmLrl2j7Df9fKOm2fItC7kMGiatP4Z
+oopxtx7o111wCIscQBALPXDJqQv9ZTSgmlc3vNSUJl/M4R8jxopARQGrR/ANyfu1
+0WsQOeaUGD9iovBpn4BDty6ltPiSkKeAZ4mYQ43cFmbZvLYOx/b4AZ6LO8sU9jJG
+Jx+4xN5jzDTqbB1+G2lRqMynh9KJeohBGlYOf4Zx5S5l8rAt7znwAslOAGqBNLFM
+8TJQylNXkND+nv9cuizYUhsSocfk3eMZpBUY7TFSGW7PvH/l/HN6miIg03yz6efa
+rOcmCht6S6K3L3l7h9iIIvdHypI64rS/YnSh39wUgRmkeKaOXMKXuPfsL5oUwh2P
+tTaHklcUU06p6xKOJiAwF69CWxKYYsdhAjm/R+GAWJK+w5M6qIBq7ZzqLmdJrnSl
+98Ll+Fa8j7dgsk7dE7hEcHw2kmDtzSK1TfZr4YYXjFXczf7ik2AbSvzfD9v9ssJG
+94AL
+-----END CERTIFICATE-----
+CERT
+security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "$CA_PATH" 2>/dev/null \
+  && echo "  CA cert trusted." \
+  || echo "  WARN: failed to import CA (may already be trusted)."
+rm -f "$CA_PATH"
+
+# ── step 5: write LaunchDaemon (tailscaled) ────────────────────────
+echo "[5/7] Configuring daemon..."
 cat > "$DAEMON_PLIST" << 'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -178,7 +221,7 @@ cat > "$DAEMON_PLIST" << 'PLIST'
 PLIST
 
 # ── step 5: write LaunchAgent (auto file receiver) ─────────────────
-echo "[5/6] Configuring file receiver..."
+echo "[6/7] Configuring file receiver..."
 cat > "$RECEIVER_PLIST" << PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -206,7 +249,7 @@ cat > "$RECEIVER_PLIST" << PLIST
 PLIST
 
 # ── step 6: start and connect ─────────────────────────────────────
-echo "[6/6] Starting and connecting..."
+echo "[7/7] Starting and connecting..."
 launchctl load "$DAEMON_PLIST"
 sleep 3
 
@@ -223,7 +266,9 @@ fi
 /usr/local/bin/tailscale up \
   --login-server="$HEADSCALE_URL" \
   --auth-key="$AUTH_KEY" \
-  --accept-dns=false \
+  --accept-routes \
+  --accept-dns \
+  --unattended \
   --reset \
   $EXIT_FLAG \
   $LAN_FLAG
