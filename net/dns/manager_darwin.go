@@ -5,7 +5,11 @@ package dns
 
 import (
 	"bytes"
+	"fmt"
+	"net/netip"
 	"os"
+	"os/exec"
+	"strings"
 
 	"go4.org/mem"
 	"tailscale.com/control/controlknobs"
@@ -28,13 +32,30 @@ func NewOSConfigurator(logf logger.Logf, _ *health.Tracker, _ *eventbus.Bus, _ p
 // darwinConfigurator is the tailscaled-on-macOS DNS OS configurator that
 // maintains the Split DNS nameserver entries pointing MagicDNS DNS suffixes
 // to 100.100.100.100 using the macOS /etc/resolver/$SUFFIX files.
+//
+// It also handles "global takeover" mode (OSConfig with empty MatchDomains
+// + non-empty Nameservers) by writing nameservers to each active network
+// service via `networksetup`, since the CLI-only fork has no NetworkExtension
+// to do this automatically.
 type darwinConfigurator struct {
 	logf   logger.Logf
 	ifName string
+
+	// lastGlobalNS is the last list of nameservers we installed as the global
+	// system resolver. Used to skip redundant networksetup calls + cache flushes
+	// when SetDNS is invoked repeatedly with unchanged config.
+	// Empty slice = no global DNS currently installed by us.
+	lastGlobalNS []netip.Addr
 }
 
 func (c *darwinConfigurator) Close() error {
 	c.removeResolverFiles(func(domain string) bool { return true })
+	// Clear global DNS only if we actually installed one, let DHCP reclaim.
+	if len(c.lastGlobalNS) > 0 {
+		if err := c.clearGlobalDNS(); err != nil {
+			c.logf("clearGlobalDNS on Close failed: %v", err)
+		}
+	}
 	return nil
 }
 
@@ -84,7 +105,130 @@ func (c *darwinConfigurator) SetDNS(cfg OSConfig) error {
 			return err
 		}
 	}
-	return c.removeResolverFiles(func(domain string) bool { return !keep[domain] })
+	if err := c.removeResolverFiles(func(domain string) bool { return !keep[domain] }); err != nil {
+		return err
+	}
+
+	// Global takeover mode (OSConfig contract):
+	//   MatchDomains empty + Nameservers non-empty → install Nameservers as the
+	//   "primary" resolver. Upstream darwin manager assumed the macOS GUI/NE
+	//   handled this; in CLI-only fork we must do it ourselves via networksetup.
+	if len(cfg.MatchDomains) == 0 && len(cfg.Nameservers) > 0 {
+		if nsEqual(c.lastGlobalNS, cfg.Nameservers) {
+			// Unchanged from last call; skip to avoid redundant networksetup
+			// invocations and mDNSResponder restarts.
+			return nil
+		}
+		if err := c.setGlobalDNS(cfg.Nameservers); err != nil {
+			c.logf("setGlobalDNS failed: %v", err)
+			// Non-fatal: split-DNS resolver files above still apply.
+			return nil
+		}
+		c.lastGlobalNS = append(c.lastGlobalNS[:0], cfg.Nameservers...)
+	} else if len(c.lastGlobalNS) > 0 {
+		// We previously installed global DNS, but the new config no longer
+		// wants it (either pure split-DNS mode or empty config). Undo.
+		if err := c.clearGlobalDNS(); err != nil {
+			c.logf("clearGlobalDNS failed: %v", err)
+		}
+		c.lastGlobalNS = nil
+	}
+	return nil
+}
+
+// nsEqual reports whether two nameserver lists are identical (order-sensitive).
+func nsEqual(a, b []netip.Addr) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// setGlobalDNS installs nameservers as the primary system resolver on every
+// active network service via `networksetup -setdnsservers`. Persists across
+// reboot (writes to SystemConfiguration Setup: store).
+func (c *darwinConfigurator) setGlobalDNS(nameservers []netip.Addr) error {
+	services, err := listActiveNetworkServices()
+	if err != nil {
+		return fmt.Errorf("listActiveNetworkServices: %w", err)
+	}
+	if len(services) == 0 {
+		c.logf("setGlobalDNS: no active network services found")
+		return nil
+	}
+
+	args := make([]string, 0, 2+len(nameservers))
+	args = append(args, "-setdnsservers", "") // service name placeholder
+	for _, ns := range nameservers {
+		args = append(args, ns.String())
+	}
+
+	for _, svc := range services {
+		args[1] = svc
+		out, err := exec.Command("networksetup", args...).CombinedOutput()
+		if err != nil {
+			c.logf("networksetup -setdnsservers %q failed: %v: %s", svc, err, out)
+			continue
+		}
+		c.logf("set DNS for %q: %v", svc, nameservers)
+	}
+
+	// Best-effort cache flush so apps pick up the new resolver immediately.
+	_ = exec.Command("dscacheutil", "-flushcache").Run()
+	_ = exec.Command("killall", "-HUP", "mDNSResponder").Run()
+	return nil
+}
+
+// clearGlobalDNS removes any tailscale-installed system DNS, letting DHCP
+// or user config reclaim. Called on Close() or when switching to split-DNS.
+func (c *darwinConfigurator) clearGlobalDNS() error {
+	services, err := listActiveNetworkServices()
+	if err != nil {
+		return fmt.Errorf("listActiveNetworkServices: %w", err)
+	}
+	for _, svc := range services {
+		// "Empty" tells networksetup to clear user-set DNS and use DHCP.
+		out, err := exec.Command("networksetup", "-setdnsservers", svc, "Empty").CombinedOutput()
+		if err != nil {
+			c.logf("networksetup clear DNS for %q failed: %v: %s", svc, err, out)
+		}
+	}
+	_ = exec.Command("dscacheutil", "-flushcache").Run()
+	_ = exec.Command("killall", "-HUP", "mDNSResponder").Run()
+	return nil
+}
+
+// listActiveNetworkServices returns enabled network service names
+// (e.g. "Wi-Fi", "Ethernet"). Disabled services (prefixed with "*"), the
+// header line, and any "Tailscale*"-named service are filtered out.
+//
+// "Tailscale" services come from prior installations of the official GUI app
+// and are mapped to a utun device; setting DNS on them is meaningless (the
+// device has no DHCP/manual DNS context) and could create surprising loops.
+func listActiveNetworkServices() ([]string, error) {
+	out, err := exec.Command("networksetup", "-listallnetworkservices").Output()
+	if err != nil {
+		return nil, err
+	}
+	var services []string
+	for i, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if i == 0 || line == "" || strings.HasPrefix(line, "*") {
+			// First line is header ("An asterisk (*) denotes...");
+			// "*"-prefixed lines are disabled services.
+			continue
+		}
+		if strings.HasPrefix(line, "Tailscale") {
+			continue
+		}
+		services = append(services, line)
+	}
+	return services, nil
 }
 
 // GetBaseConfig returns the current OS DNS configuration, extracting it from /etc/resolv.conf.
