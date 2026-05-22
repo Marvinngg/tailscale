@@ -8,7 +8,11 @@ set -e
 #   * Download BEFORE cleanup (so failed install doesn't destroy existing state)
 #   * Write /etc/hosts to bypass local DNS interception (e.g. Clash mihomo)
 #
-# Usage:
+# Usage (推荐: 先下载到本地, 网络抖动也能完整跑完, 避免半装状态):
+#   curl -fsSL -o /tmp/install.sh https://github.com/Marvinngg/tailscale/releases/download/v1.94.2-ag3/install.sh
+#   sudo bash /tmp/install.sh --key=hskey-auth-xxxx
+#
+# Or one-liner (less robust, network must hold):
 #   curl -fsSL <release-url>/install.sh | sudo bash -s -- --key=hskey-auth-xxxx
 #
 # Options:
@@ -27,7 +31,7 @@ AUTH_KEY=""
 WRITE_HOSTS=true
 DAEMON_PLIST="/Library/LaunchDaemons/com.tailscale.tailscaled.plist"
 RECEIVER_PLIST="/Library/LaunchAgents/com.tailscale.file-receiver.plist"
-RELEASE_URL="https://github.com/Marvinngg/tailscale/releases/download/v1.94.2-ag2"
+RELEASE_URL="https://github.com/Marvinngg/tailscale/releases/download/v1.94.2-ag3"
 
 # ── parse args ──────────────────────────────────────────────────────
 for arg in "$@"; do
