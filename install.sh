@@ -45,9 +45,19 @@ for arg in "$@"; do
   esac
 done
 
-if [ -z "$AUTH_KEY" ]; then
-  echo "Error: --key is required"
+# --key is required for FIRST install. Existing installs can update binaries
+# WITHOUT a key by re-running this script without --key (it detects the
+# state file and skips the `tailscale up --reset` step, reusing the
+# existing machine identity).
+EXISTING_INSTALL=false
+if [ -f /var/lib/tailscale/tailscaled.state ] || [ -f /Library/Tailscale/tailscaled.state ]; then
+  EXISTING_INSTALL=true
+fi
+
+if [ -z "$AUTH_KEY" ] && [ "$EXISTING_INSTALL" = false ]; then
+  echo "Error: --key is required for first install (no existing state file found)"
   echo "Usage: curl -fsSL .../install.sh | sudo bash -s -- --key=hskey-auth-xxxx"
+  echo "(After first install, re-run WITHOUT --key to update binaries only.)"
   exit 1
 fi
 
@@ -254,14 +264,24 @@ if [ -n "$EXIT_NODE" ]; then
 fi
 
 # NOTE: --unattended removed (not supported on macOS binary)
-/usr/local/bin/tailscale up \
-  --login-server="$HEADSCALE_URL" \
-  --auth-key="$AUTH_KEY" \
-  --accept-routes \
-  --accept-dns \
-  --reset \
-  $EXIT_FLAG \
-  $LAN_FLAG
+if [ -n "$AUTH_KEY" ]; then
+  # Fresh install (or explicit re-register): run `tailscale up --reset`
+  # with auth-key. --reset wipes prefs and re-applies the flags below.
+  echo "  Mode: register with auth-key"
+  /usr/local/bin/tailscale up \
+    --login-server="$HEADSCALE_URL" \
+    --auth-key="$AUTH_KEY" \
+    --accept-routes \
+    --accept-dns \
+    --reset \
+    $EXIT_FLAG \
+    $LAN_FLAG
+else
+  # Update mode: state file exists, reuse machine identity. The daemon
+  # restart above already picks up the new binaries; tailscale comes back
+  # online with the cached node key automatically — no key needed.
+  echo "  Mode: update (reuse existing identity, no auth-key needed)"
+fi
 
 sleep 3
 
