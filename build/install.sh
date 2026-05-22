@@ -3,7 +3,7 @@ set -e
 
 # ── Antigravity Tailscale Installer (macOS) ─────────────────────────
 # Usage:
-#   curl -fsSL https://github.com/Marvinngg/tailscale/releases/download/v1.94.2-ag2/install.sh | sudo bash -s -- --key=hskey-auth-xxxx
+#   curl -fsSL https://github.com/Marvinngg/tailscale/releases/download/v1.94.2-ag3/install.sh | sudo bash -s -- --key=hskey-auth-xxxx
 #
 # Options:
 #   --key=KEY          Headscale pre-auth key (required)
@@ -17,7 +17,7 @@ EXIT_NODE="100.96.0.1"
 AUTH_KEY=""
 DAEMON_PLIST="/Library/LaunchDaemons/com.tailscale.tailscaled.plist"
 RECEIVER_PLIST="/Library/LaunchAgents/com.tailscale.file-receiver.plist"
-RELEASE_URL="https://github.com/Marvinngg/tailscale/releases/download/v1.94.2-ag2"
+RELEASE_URL="https://github.com/Marvinngg/tailscale/releases/download/v1.94.2-ag3"
 
 # ── parse args ──────────────────────────────────────────────────────
 for arg in "$@"; do
