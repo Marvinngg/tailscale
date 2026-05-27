@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -125,6 +126,21 @@ func (s *Service) Start(ctx context.Context) error {
 		}
 
 		addr := fmt.Sprintf("%s:%d", ip, s.cfg.Port)
+
+		// Auto-derive ServerAddr from our own tailnet IP if unset.
+		// Headscale assigns the first node (exit node) as <a>.<b>.0.1,
+		// so any client on the same tailnet can subscribe there.
+		if s.cfg.ServerAddr == "" {
+			parts := strings.Split(ip, ".")
+			if len(parts) == 4 {
+				s.cfg.ServerAddr = fmt.Sprintf("%s.%s.0.1:%d", parts[0], parts[1], s.cfg.Port)
+			}
+		}
+		// Don't subscribe to ourselves (the exit node case).
+		if s.cfg.ServerAddr == addr {
+			s.cfg.ServerAddr = ""
+		}
+
 		s.server = &http.Server{
 			Addr:    addr,
 			Handler: withAuth(&s.lc, mux),
@@ -198,12 +214,16 @@ func findTailscaleIP() string {
 			case *net.IPAddr:
 				ip = v.IP
 			}
-			if ip == nil || ip.To4() == nil {
+			// net.IPNet.IP on macOS often stores IPv4 as 16-byte
+			// IPv4-mapped IPv6; To4() normalizes to a 4-byte slice so
+			// the [0]/[1] index actually reads the IPv4 octets.
+			ip4 := ip.To4()
+			if ip4 == nil {
 				continue
 			}
 			// Tailscale CGNAT: 100.64.0.0/10
-			if ip[0] == 100 && ip[1] >= 64 && ip[1] <= 127 {
-				return ip.String()
+			if ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127 {
+				return ip4.String()
 			}
 		}
 	}

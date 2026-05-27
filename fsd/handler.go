@@ -306,10 +306,25 @@ func (h *Handlers) HandleBroadcast(w http.ResponseWriter, r *http.Request) {
 	nodeName, _, role := CallerInfo(r)
 	acl := GetACL()
 
+	// New stream protocol: file bytes are the request body; metadata
+	// rides on query string. (Legacy JSON-only path read file path from
+	// body and tried to ReadFile locally on the server, which never
+	// worked across machines — clients have their files locally, not
+	// the server.)
 	var req SendRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, fmt.Sprintf("invalid request: %v", err), http.StatusBadRequest)
-		return
+	if ct := r.Header.Get("Content-Type"); ct == "" || ct == "application/octet-stream" {
+		req.File = r.URL.Query().Get("file")
+		req.Group = r.URL.Query().Get("group")
+		if t := r.URL.Query().Get("targets"); t != "" {
+			req.Targets = strings.Split(t, ",")
+		}
+	} else {
+		// Back-compat for any old callers sending JSON: still parse it,
+		// but they will get the same broken behaviour as before.
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, fmt.Sprintf("invalid request: %v", err), http.StatusBadRequest)
+			return
+		}
 	}
 
 	group := req.Group
@@ -330,17 +345,36 @@ func (h *Handlers) HandleBroadcast(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Read the file
-	filePath := req.File
-	if !filepath.IsAbs(filePath) {
-		filePath = filepath.Join(h.cfg.SharedDir, filePath)
-	}
-	data, err := os.ReadFile(filePath)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("read file: %v", err), http.StatusBadRequest)
+	if req.File == "" {
+		http.Error(w, "missing file name (?file= query param)", http.StatusBadRequest)
 		return
 	}
-	fileName := filepath.Base(filePath)
+	fileName := filepath.Base(req.File)
+
+	// Read file bytes: from body (stream protocol) or from local disk (legacy).
+	var data []byte
+	var err error
+	if ct := r.Header.Get("Content-Type"); ct == "" || ct == "application/octet-stream" {
+		data, err = io.ReadAll(http.MaxBytesReader(w, r.Body, 512<<20)) // 512 MiB cap
+		if err != nil {
+			http.Error(w, fmt.Sprintf("read body: %v", err), http.StatusBadRequest)
+			return
+		}
+		if len(data) == 0 {
+			http.Error(w, "empty body (broadcast requires file content)", http.StatusBadRequest)
+			return
+		}
+	} else {
+		filePath := req.File
+		if !filepath.IsAbs(filePath) {
+			filePath = filepath.Join(h.cfg.SharedDir, filePath)
+		}
+		data, err = os.ReadFile(filePath)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("read file: %v", err), http.StatusBadRequest)
+			return
+		}
+	}
 
 	// Store in broadcast directory
 	bcDir := filepath.Join(h.cfg.SharedDir, "broadcast")

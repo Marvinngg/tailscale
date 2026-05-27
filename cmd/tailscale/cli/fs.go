@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -434,10 +435,11 @@ func runFsBroadcast(ctx context.Context, args []string) error {
 		group = ""
 	}
 
-	data, err := os.ReadFile(filePath)
+	f, err := os.Open(filePath)
 	if err != nil {
-		return fmt.Errorf("read %s: %w", filePath, err)
+		return fmt.Errorf("open %s: %w", filePath, err)
 	}
+	defer f.Close()
 
 	st, err := localClient.Status(ctx)
 	if err != nil {
@@ -449,29 +451,48 @@ func runFsBroadcast(ctx context.Context, args []string) error {
 
 	// Broadcast goes to the SERVER's fsd (exit node), not local.
 	// Server does permission check and SSE notification.
-	serverIP := "100.64.0.1" // default exit node
-	// Try to find actual exit node from status
-	for _, p := range st.Peer {
-		if p.ExitNode {
-			if len(p.TailscaleIPs) > 0 {
-				serverIP = p.TailscaleIPs[0].String()
-			}
+	// Derive server IP: same /16 tailnet prefix as us, host .0.1.
+	// (Headscale assigns the first registered node — the exit node — as <a>.<b>.0.1.)
+	var serverIP string
+	for _, ip := range st.TailscaleIPs {
+		if !ip.Unmap().Is4() {
+			continue
+		}
+		ip4 := ip.Unmap().As4()
+		if ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127 {
+			serverIP = fmt.Sprintf("%d.%d.0.1", ip4[0], ip4[1])
 			break
 		}
 	}
-
-	body := map[string]interface{}{
-		"file": filePath,
+	// Prefer an actually-selected exit node if user has one configured.
+	for _, p := range st.Peer {
+		if p.ExitNode && len(p.TailscaleIPs) > 0 {
+			serverIP = p.TailscaleIPs[0].String()
+			break
+		}
 	}
+	if serverIP == "" {
+		return fmt.Errorf("no tailnet IP found; is tailscale up?")
+	}
+
+	// Stream the file body. Metadata goes on the query string so the
+	// server doesn't need multipart parsing.
+	fileName := filepath.Base(filePath)
+	q := url.Values{}
+	q.Set("file", fileName)
 	if group != "" {
-		body["group"] = group
+		q.Set("group", group)
 	}
 	if len(targets) > 0 {
-		body["targets"] = targets
+		q.Set("targets", strings.Join(targets, ","))
 	}
-	reqBody, _ := json.Marshal(body)
-	url := fmt.Sprintf("http://%s:%d/broadcast", serverIP, fsdPort)
-	resp, err := http.Post(url, "application/json", bytes.NewReader(reqBody))
+	bcURL := fmt.Sprintf("http://%s:%d/broadcast?%s", serverIP, fsdPort, q.Encode())
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, bcURL, f)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -480,6 +501,10 @@ func runFsBroadcast(ctx context.Context, args []string) error {
 	if resp.StatusCode == http.StatusForbidden {
 		return fmt.Errorf("permission denied: your role cannot broadcast")
 	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
 
 	var results []struct {
 		Target string `json:"target"`
@@ -487,12 +512,10 @@ func runFsBroadcast(ctx context.Context, args []string) error {
 	}
 	json.NewDecoder(resp.Body).Decode(&results)
 
-	fileName := filepath.Base(filePath)
 	fmt.Printf("  broadcast %s to %s:\n", fileName, group)
 	for _, r := range results {
 		fmt.Printf("    %s: %s\n", r.Target, r.Status)
 	}
 
-	_ = data // file read by fsd from path
 	return nil
 }
