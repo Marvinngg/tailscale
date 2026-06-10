@@ -7,8 +7,8 @@ curl -fsSL https://raw.githubusercontent.com/Marvinngg/tailscale/antigravity/v1.
 
 参数：
   --key=KEY          Headscale 认证密钥（必填）
-  --server=URL       Headscale 地址（默认 https://hs.marvinai.qzz.io:8443）
-  --exit-node=IP     出口节点（默认 100.64.0.1）
+  --server=URL       Headscale 地址（默认 https://hs.263onet.com:8443）
+  --exit-node=IP     出口节点（默认 100.96.0.1）
   --no-exit-node     不设出口节点
 
 ## 功能
@@ -19,14 +19,14 @@ curl -fsSL https://raw.githubusercontent.com/Marvinngg/tailscale/antigravity/v1.
 
 ### 出口节点
 
-   tailscale set --exit-node=100.64.0.1
+   tailscale set --exit-node=100.96.0.1
    tailscale set --exit-node=             # 关闭
 
 ### 文件传输
 
 发送文件：
 
-   tailscale fs send 文件名.txt 100.64.0.9
+   tailscale fs send 文件名.txt 100.96.0.4
 
 查看收到的文件：
 
@@ -36,7 +36,7 @@ curl -fsSL https://raw.githubusercontent.com/Marvinngg/tailscale/antigravity/v1.
 
 浏览远程共享文件库：
 
-   tailscale fs ls 100.64.0.9:
+   tailscale fs ls 100.96.0.4:
 
 广播文件给所有在线设备：
 
