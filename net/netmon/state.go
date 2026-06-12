@@ -44,6 +44,16 @@ func isProblematicInterface(nif *net.Interface) bool {
 	if strings.HasPrefix(name, "zt") || (runtime.GOOS == "windows" && strings.Contains(name, "ZeroTier")) {
 		return true
 	}
+	// fork: exclude mihomo / Clash Meta TUN interfaces. On the exit-node
+	// server, mihomo's TUN device ("Meta") carries a fake-ip address
+	// (198.20.0.0/30) that is not a real network endpoint. If we treat it
+	// as a local interface address, magicsock advertises
+	// 198.20.0.0:41641 as a candidate WireGuard endpoint to all peers.
+	// Every client then wastes a disco round trying to reach it — which
+	// slows down reconnection after a network switch (WiFi → hotspot).
+	if name == "Meta" || strings.HasPrefix(name, "mihomo") || strings.HasPrefix(name, "clash") {
+		return true
+	}
 	return false
 }
 
